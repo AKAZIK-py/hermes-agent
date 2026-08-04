@@ -11023,6 +11023,14 @@ def _session_latest_descendant(session_id: str, db):
 
     /model may create child sessions. Dashboard refresh should continue the
     newest child instead of reopening the old parent.
+
+    Delegate subagent sessions (created via the delegate_task tool, tagged in
+    ``model_config._delegate_from``) are NOT continuation targets: they are
+    short-lived parallel workers spawned *by* the parent, not forks the user
+    chose to continue. Including them hijacks the resume — clicking the parent
+    session in the dashboard silently opens the newest subagent session
+    instead. The recursion skips them, so a parent with only delegate children
+    resolves back to itself.
     """
     def row_get(row, key, index):
         if isinstance(row, dict):
@@ -11050,18 +11058,25 @@ def _session_latest_descendant(session_id: str, db):
     if conn is not None:
         raw_rows = conn.execute(
             """
-            WITH RECURSIVE descendants(id, parent_session_id, started_at) AS (
-                SELECT id, parent_session_id, started_at FROM sessions WHERE id = ?
+            WITH RECURSIVE descendants(id, parent_session_id, started_at, model_config) AS (
+                SELECT id, parent_session_id, started_at, model_config FROM sessions WHERE id = ?
                 UNION
-                SELECT s.id, s.parent_session_id, s.started_at
+                SELECT s.id, s.parent_session_id, s.started_at, s.model_config
                 FROM sessions s
                 JOIN descendants d ON s.parent_session_id = d.id
             )
-            SELECT id, parent_session_id, started_at FROM descendants
+            SELECT id, parent_session_id, started_at, model_config FROM descendants
             """,
             (sid,),
         ).fetchall()
         for row in raw_rows:
+            # Skip delegate subagent sessions: they are not continuation
+            # targets (see docstring). The tag lives in model_config as
+            # "_delegate_from": "<parent session id>", written by
+            # delegate_tool when spawning the child.
+            model_config = row_get(row, "model_config", 3) or ""
+            if "_delegate_from" in model_config:
+                continue
             rows.append({
                 "id": row_get(row, "id", 0),
                 "parent_session_id": row_get(row, "parent_session_id", 1),
@@ -11069,6 +11084,10 @@ def _session_latest_descendant(session_id: str, db):
             })
     else:
         rows = db.list_sessions_rich(limit=10000, offset=0, compact_rows=True)
+        rows = [
+            r for r in rows
+            if "_delegate_from" not in (r.get("model_config") or "")
+        ]
 
     children = {}
     for row in rows:
@@ -15744,6 +15763,15 @@ async def pty_ws(ws: WebSocket) -> None:
         return
 
     # Keep-alive path: the PTY outlives this socket; reattach by token.
+    # Client may send ?offset=N (total bytes it has already received) so the
+    # server can send an incremental replay instead of the full RingBuffer.
+    raw_offset = ws.query_params.get("offset") or ""
+    client_pty_offset: Optional[int] = None
+    if raw_offset:
+        try:
+            client_pty_offset = int(raw_offset)
+        except ValueError:
+            client_pty_offset = None
     try:
         session, _created = await PTY_REGISTRY.attach_or_spawn(
             attach_token, spawn=_spawn
@@ -15757,7 +15785,7 @@ async def pty_ws(ws: WebSocket) -> None:
         await ws.close(code=1011)
         return
 
-    await session.attach(ws)
+    await session.attach(ws, client_offset=client_pty_offset)
 
     # --- writer loop: WebSocket → PTY master ----------------------------
     # No reader task here: the session's drain task (spawned once per PTY,
@@ -17573,11 +17601,18 @@ def start_server(
         # mode.
         proxy_headers=bool(app.state.auth_required),
         # Half-open detection for public binds only (see above). Loopback
-        # disables the protocol ping (None) so an event-loop stall can never
-        # trigger a false disconnect; a genuinely dead local client is still
-        # reaped via the WebSocketDisconnect → disconnect/reap path.
-        ws_ping_interval=None if _is_loopback else 20.0,
-        ws_ping_timeout=None if _is_loopback else 20.0,
+        # used to disable the protocol ping entirely (None) so an event-loop
+        # stall could never trigger a false disconnect. But Chrome's background
+        # tab throttling freezes JS timers while leaving the browser network
+        # stack responsive — so without a protocol-level ping, the WebSocket
+        # silently dies when the tab is backgrounded, and reconnect-on-resume
+        # replays the full 1 MB RingBuffer into xterm.js, causing multi-second
+        # lag. A gentle 30 s ping keeps the connection alive through tab
+        # switches (pong is answered by the network stack, not JS), while a
+        # 60 s timeout gives a 12× margin over the 5 s event-loop stall
+        # threshold (see _loop_heartbeat watchdog above).
+        ws_ping_interval=30.0 if _is_loopback else 20.0,
+        ws_ping_timeout=60.0 if _is_loopback else 20.0,
         ws_max_size=_DESKTOP_ATTACHMENT_WS_MAX_BYTES,
     )
     server = uvicorn.Server(config)

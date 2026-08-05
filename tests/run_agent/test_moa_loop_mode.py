@@ -1249,3 +1249,54 @@ def test_render_tool_calls_tolerates_namespace_shapes():
 
     # Degenerate shapes still fall back safely.
     assert _render_tool_calls([SimpleNamespace()]) == "[called tool: tool]"
+
+
+def test_reference_system_prompt_forbids_restating_tool_logs():
+    """Reference advisors must not reproduce tool-log-style text in advice.
+
+    The transcript shown to references renders the acting agent's tool history
+    as `[called tool: ...]` / `[tool result: ...]` lines. Without an explicit
+    ban, advisors echo those lines back as if they had executed something,
+    and the aggregator mistakes the restatement for a verified fact (the
+    "MOA reference tool records untrustworthy" bug). The system prompt must
+    forbid quoting/restating the transcript's tool lines and emitting
+    tool-log-style text (e.g. `TOOL: ... ran`, `exit 0`)."""
+    from agent.moa_loop import _REFERENCE_SYSTEM_PROMPT
+
+    assert "must not quote, restate, or reproduce them as your own" in (
+        _REFERENCE_SYSTEM_PROMPT
+    )
+    assert "`TOOL: ... ran`" in _REFERENCE_SYSTEM_PROMPT
+    assert "prose only" in _REFERENCE_SYSTEM_PROMPT
+
+
+def test_aggregator_prompt_flags_reference_outputs_as_advice_not_logs():
+    """The aggregator must treat reference outputs as advisory, not execution.
+
+    Reference responses are joined verbatim into the synthesis prompt, so a
+    reference that echoes tool-log lines would otherwise read as a verified
+    execution record. The aggregator prompt must instruct the synthesizer that
+    reference tool-call/result text is restatement or hallucination — never a
+    fact the reference verified — so the main agent verifies before acting."""
+    from agent.moa_loop import _build_synthesis_prompt
+
+    prompt = _build_synthesis_prompt(
+        user_prompt="test prompt",
+        reference_outputs=[
+            (
+                "openrouter:claude-x",
+                "I ran the test suite and all 12 tests passed. TOOL: [terminal] "
+                "ran `pytest` exit 0. [tool result: 12 passed]",
+                None,
+            )
+        ],
+        failed_labels=[],
+        degraded_reference_policy=None,
+    )
+
+    assert "ADVICE, not execution logs" in prompt
+    assert "executed nothing" in prompt
+    assert "never a fact the reference verified" in prompt
+    # The reference's claimed result is preserved for context but the prompt
+    # frames it as unverified advice.
+    assert "all 12 tests passed" in prompt

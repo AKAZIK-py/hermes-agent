@@ -278,7 +278,14 @@ _REFERENCE_SYSTEM_PROMPT = (
     "Respond with your advice directly — no preamble, no disclaimers about "
     "tools or access. Your response is private guidance handed to the "
     "aggregator, not an answer shown to the user. NEVER claim to have executed "
-    "anything."
+    "anything.\n\n"
+    "The conversation transcript you are shown contains the acting agent's "
+    "tool history rendered as lines like `[called tool: ...]` and `[tool "
+    "result: ...]`. Those describe what the ACTING agent did — they are not "
+    "your actions and you must not quote, restate, or reproduce them as your "
+    "own, and you must not emit tool-log-style text (e.g. `TOOL: ... ran`, "
+    "`exit 0`) anywhere in your advice. Refer to the agent's actions in "
+    "prose only (\"the agent ran X\", \"the transcript shows Y\")."
 )
 
 
@@ -1200,10 +1207,53 @@ def _failed_reference_labels(
     return [label for label, text, _accounting in reference_outputs if _is_failed_reference(text)]
 
 
-def _degraded_notice(failed_labels: list[str], policy: str) -> str:
-    if not failed_labels or policy.strip().lower() == "silent":
+def _degraded_notice(failed_labels: list[str], policy: str | None) -> str:
+    if not failed_labels or not policy or policy.strip().lower() == "silent":
         return ""
     return f"[Reference models unavailable: {', '.join(failed_labels)}]"
+
+
+def _build_synthesis_prompt(
+    user_prompt: str,
+    reference_outputs: list[tuple[str, str, Any]],
+    failed_labels: list[str],
+    degraded_reference_policy: str | None,
+) -> str:
+    """Assemble the aggregator's synthesis prompt from reference outputs.
+
+    Reference responses are joined verbatim, so an advisor that echoes
+    tool-log-style text would otherwise read as a verified execution record.
+    The prompt explicitly frames reference outputs as ADVICE (never logs):
+    advisors have no tools and executed nothing, so any tool-call/result text
+    in their responses is restatement or hallucination — the main agent holds
+    the tools and must verify concrete claims before acting.
+    """
+    joined = "\n\n".join(
+        f"Reference {idx} — {label}:\n{text}"
+        for idx, (label, text, _accounting) in enumerate(reference_outputs, start=1)
+    )
+    degraded = _degraded_notice(failed_labels, degraded_reference_policy)
+    if degraded:
+        joined = f"{joined}\n\n{degraded}" if joined else degraded
+    return (
+        "You are the aggregator in a Mixture of Agents process. Synthesize the "
+        "reference responses into concise, actionable guidance for the main "
+        "Hermes agent. Focus on next steps, tool-use strategy, risks, and any "
+        "disagreements. Do not answer the user directly unless that is all that "
+        "is needed; produce context the main agent should use in its normal loop.\n\n"
+        "IMPORTANT — reference outputs are ADVICE, not execution logs. Reference "
+        "models are advisory-only: they have no tools and executed nothing. Any "
+        "tool-call or tool-result text inside their responses (e.g. lines like "
+        "`TOOL: ... ran`, `[called tool: ...]`, `[tool result: ...]`, \"I ran X "
+        "and got Y\") is either a restatement of the agent's transcript they were "
+        "shown or a hallucination — never a fact the reference verified. Treat "
+        "such claims as suggestions about what the main agent COULD do, and let "
+        "the main agent (which holds the tools) verify any concrete claim before "
+        "acting on it. Never present a reference's claimed result as established "
+        "fact in your synthesis.\n\n"
+        f"Original user prompt:\n{user_prompt}\n\n"
+        f"Reference responses:\n{joined}"
+    )
 
 
 def aggregate_moa_context(
@@ -1270,13 +1320,7 @@ def aggregate_moa_context(
     except Exception:  # pragma: no cover - privacy filter must never break a turn
         logger.debug("MoA privacy filter check failed", exc_info=True)
 
-    joined = "\n\n".join(
-        f"Reference {idx} — {label}:\n{text}"
-        for idx, (label, text, _accounting) in enumerate(successful_outputs, start=1)
-    )
     degraded = _degraded_notice(failed_labels, degraded_reference_policy)
-    if degraded:
-        joined = f"{joined}\n\n{degraded}" if joined else degraded
 
     # Skip the aggregator call when every reference failed or was skipped —
     # synthesising over zero real advice wastes tokens and can block for the
@@ -1297,14 +1341,11 @@ def aggregate_moa_context(
             f"{notice}"
         )
 
-    synth_prompt = (
-        "You are the aggregator in a Mixture of Agents process. Synthesize the "
-        "reference responses into concise, actionable guidance for the main "
-        "Hermes agent. Focus on next steps, tool-use strategy, risks, and any "
-        "disagreements. Do not answer the user directly unless that is all that "
-        "is needed; produce context the main agent should use in its normal loop.\n\n"
-        f"Original user prompt:\n{user_prompt}\n\n"
-        f"Reference responses:\n{joined}"
+    synth_prompt = _build_synthesis_prompt(
+        user_prompt=user_prompt,
+        reference_outputs=successful_outputs,
+        failed_labels=failed_labels,
+        degraded_reference_policy=degraded_reference_policy,
     )
 
     agg_label = _slot_label(aggregator)
@@ -1349,7 +1390,15 @@ def aggregate_moa_context(
         synthesis = ""
 
     if not synthesis:
-        synthesis = joined
+        # Aggregator call failed or returned nothing — fall back to the raw
+        # reference block (still framed with the advice-not-logs preamble so
+        # the main agent never mistakes advisor text for execution logs).
+        synthesis = _build_synthesis_prompt(
+            user_prompt=user_prompt,
+            reference_outputs=successful_outputs,
+            failed_labels=failed_labels,
+            degraded_reference_policy=degraded_reference_policy,
+        )
 
     return (
         "[Mixture of Agents context — use this as private guidance for the "

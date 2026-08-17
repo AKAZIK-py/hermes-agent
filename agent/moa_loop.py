@@ -732,6 +732,13 @@ class _SharedDelegateNode:
             override_api_key=runtime.get("api_key"),
             override_api_mode=runtime.get("api_mode"),
         )
+        # Empty-response policy for the reference child: an empty reference is
+        # "no useful advice", not a user-facing failure. Fail fast (no empty
+        # retry, no fallback-chain walk) so the serial shared node is not held
+        # re-billing a deterministically-empty reference, and the pinned
+        # reference model's identity is never silently swapped by a fallback.
+        # Consumed by the empty-retry gate in run_conversation.
+        setattr(child, "_reference_delegate_child", True)
         result = _run_child_lifecycle(
             task_index=0,
             goal=goal,

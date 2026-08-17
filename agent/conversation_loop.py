@@ -7755,6 +7755,17 @@ def run_conversation(
                     _empty_candidate = _truly_empty and (
                         not _has_structured or _prefill_exhausted
                     )
+                    # Reference-delegate children are advisory and pinned to a
+                    # specific reference model. An empty reference means "no
+                    # useful advice", not "the user got no answer": retrying
+                    # re-bills the child's input for no benefit, and walking
+                    # the fallback chain would silently swap the pinned model
+                    # and corrupt the reference signal's identity. Degrade
+                    # immediately instead — the child returns "(empty)" and the
+                    # advisor answers from its own context.
+                    _reference_child = bool(
+                        getattr(agent, "_reference_delegate_child", False)
+                    )
                     if _empty_candidate:
                         # NS-503: every empty attempt re-sends the full
                         # conversation input at full price. Record the
@@ -7770,9 +7781,13 @@ def run_conversation(
                             response=response,
                         )
                     _empty_retry_budget = (
-                        _empty_guard.empty_retry_budget(agent, response)
-                        if _empty_candidate
-                        else _empty_guard.DEFAULT_EMPTY_RETRY_BUDGET
+                        0
+                        if _reference_child
+                        else (
+                            _empty_guard.empty_retry_budget(agent, response)
+                            if _empty_candidate
+                            else _empty_guard.DEFAULT_EMPTY_RETRY_BUDGET
+                        )
                     )
                     _deterministic_empty = _empty_candidate and (
                         _empty_guard.deterministic_empty(agent)
@@ -7853,7 +7868,9 @@ def run_conversation(
                     # chain.  This covers the case where a model
                     # (e.g. GLM-4.5-Air) consistently returns empty
                     # due to context degradation or provider issues.
-                    if _truly_empty and agent._fallback_chain:
+                    # Reference-delegate children skip this: the fallback
+                    # would silently swap their pinned reference model.
+                    if _truly_empty and not _reference_child and agent._fallback_chain:
                         logger.warning(
                             "Empty response after %d retries — "
                             "attempting fallback (model=%s, provider=%s)",

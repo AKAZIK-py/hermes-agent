@@ -1711,6 +1711,53 @@ def test_reference_delegate_shared_node_queue_timeout(monkeypatch):
     assert calls["n"] == 1
 
 
+def test_reference_delegate_child_marks_fail_open_empty_policy(monkeypatch, tmp_path):
+    """The built reference child is flagged so an empty reference degrades
+    immediately (no retry, no fallback) — advisory output, not a user-facing
+    failure to re-bill and model-swap for."""
+    from agent import moa_loop
+    import tools.delegate_tool as delegate_tool
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    captured = {}
+
+    class FakeChild:
+        model = "deepseek-v4-flash"
+
+    def fake_build(task_index, goal, context, toolsets, model, max_iterations,
+                   task_count, parent_agent, role="leaf", **override_kwargs):
+        return FakeChild()
+
+    def fake_lifecycle(task_index, goal, child=None, parent_agent=None):
+        assert child is not None
+        captured["child_flag"] = getattr(child, "_reference_delegate_child", None)
+        return {"status": "completed", "exit_reason": "completed",
+                "api_calls": 1, "model": child.model, "output": "ok",
+                "success": True}
+
+    monkeypatch.setattr(delegate_tool, "_build_child_agent", fake_build)
+    monkeypatch.setattr(delegate_tool, "_run_child_lifecycle", fake_lifecycle)
+    monkeypatch.setattr(moa_loop, "_slot_runtime", lambda slot: {
+        "provider": slot["provider"], "model": slot["model"],
+        "base_url": "https://api.deepseek.com", "api_key": "sk-test",
+        "api_mode": "chat_completions",
+    })
+
+    cfg = moa_loop._reference_delegate_config(
+        {"enabled": True, "provider": "deepseek", "model": "deepseek-v4-flash"}
+    )
+    out = moa_loop._execute_reference_delegate(
+        "verify", None, parent_agent=None, delegate_cfg=cfg)
+
+    assert out == "ok"
+    # The flag is set on the child BEFORE the lifecycle runs, so the child's
+    # own run_conversation empty-retry gate sees it and degrades immediately.
+    assert captured["child_flag"] is True
+
+
 # --- Shared delegate node: dedupe, routing, config parsing -----------------
 
 

@@ -9460,6 +9460,22 @@ def _call_llm_impl(
     if _is_anthropic_compat_endpoint(request_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
+    # Reasoning echo-back for require-side providers (DeepSeek / Kimi /
+    # MiMo thinking mode): the provider requires EVERY assistant message to
+    # carry reasoning_content (DeepSeek otherwise 400s with "The
+    # reasoning_content in the thinking mode must be passed back to the
+    # API"). The main-agent path reconciles via reapply_reasoning_echo
+    # before building request kwargs; auxiliary/reference calls
+    # (moa_loop references, etc.) build their own message lists and never
+    # go through that path — pad them here, idempotently.
+    from agent.message_sanitization import (
+        needs_reasoning_echo,
+        reapply_reasoning_echo,
+    )
+
+    if needs_reasoning_echo(resolved_provider, final_model, _client_base):
+        reapply_reasoning_echo(kwargs["messages"], needs_thinking_pad=True)
+
     # Streaming path: return the raw SDK Stream iterator directly. This is used by
     # the MoA aggregator so its tokens stream to the user. It deliberately skips
     # _validate_llm_response and the temperature/max_tokens/payment fallback chain

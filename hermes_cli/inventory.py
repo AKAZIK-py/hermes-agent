@@ -603,9 +603,28 @@ def _append_unconfigured_rows(
     exception is the *current* configured provider: if config.yaml still points
     at it but credentials are presently unavailable, keep a visible row carrying
     the saved model so GUI pickers don't silently snap to some other provider.
+
+    ``model_catalog.excluded_providers`` is honoured here too — a provider the
+    user excluded must not sneak back in through the unconfigured-skeleton path
+    (which is exactly what TUI pickers with ``include_unconfigured=True`` would
+    otherwise show, e.g. moonshot / kimi-coding-cn / copilot rows the user
+    never configured and explicitly excluded).
     """
     from hermes_cli.auth import PROVIDER_REGISTRY
-    from hermes_cli.models import CANONICAL_PROVIDERS, _PROVIDER_LABELS
+    from hermes_cli.models import (
+        CANONICAL_PROVIDERS,
+        _PROVIDER_ALIASES,
+        _PROVIDER_LABELS,
+    )
+
+    excluded = {str(p).strip().lower() for p in (ctx.excluded_providers or []) if p}
+    # Match slug OR alias, mirroring list_authenticated_providers and the
+    # `hermes model` CLI picker (main.py _cli_excluded).
+    _names_for: dict[str, set[str]] = {}
+    for _p in CANONICAL_PROVIDERS:
+        _names_for[_p.slug] = {_p.slug.lower()}
+    for _alias, _canon in _PROVIDER_ALIASES.items():
+        _names_for.setdefault(_canon, {_canon.lower()}).add(_alias.lower())
 
     seen = {r["slug"].lower() for r in rows}
     cur = (ctx.current_provider or "").lower()
@@ -613,6 +632,8 @@ def _append_unconfigured_rows(
     extras: list[dict] = []
     for entry in CANONICAL_PROVIDERS:
         if entry.slug.lower() in seen:
+            continue
+        if excluded and _names_for.get(entry.slug, {entry.slug.lower()}) & excluded:
             continue
         if current_only and entry.slug.lower() != cur:
             continue

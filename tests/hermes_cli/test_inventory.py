@@ -169,6 +169,40 @@ def test_include_unconfigured_appends_canonical_skeletons():
     assert all(r["total_models"] == 0 for r in skeletons)
 
 
+def test_include_unconfigured_honours_excluded_providers():
+    """excluded_providers must suppress the unconfigured-skeleton path too.
+
+    TUI pickers pass include_unconfigured=True to offer "paste KEY to
+    activate" rows — a provider the user explicitly excluded (e.g. a
+    moonshot profile they never configured) must not sneak back in
+    through that path. Matches slug AND alias (same matching as
+    list_authenticated_providers and the `hermes model` CLI picker).
+    """
+    rows = [
+        {"slug": "openrouter", "name": "OpenRouter", "models": ["m1"],
+         "total_models": 1, "is_current": True, "is_user_defined": False,
+         "source": "built-in"},
+    ]
+    # Exclude by canonical slug + by alias (moonshot is an alias of
+    # kimi-coding / kimi-coding-cn).
+    ctx = ConfigContext(
+        current_provider="openrouter",
+        current_model="m1",
+        current_base_url="",
+        user_providers={},
+        custom_providers=[],
+        excluded_providers=["kimi-coding-cn", "moonshot"],
+    )
+    with _list_auth_returning(rows):
+        payload = build_models_payload(ctx, include_unconfigured=True)
+
+    slugs = {r["slug"].lower() for r in payload["providers"]}
+    assert "kimi-coding-cn" not in slugs, "excluded canonical slug leaked"
+    assert "kimi-coding" not in slugs, "excluded via alias (moonshot) leaked"
+    # A non-excluded canonical provider still gets a skeleton row.
+    assert "anthropic" in slugs
+
+
 def test_explicit_only_filters_ambient_credentials_but_keeps_current_and_custom_rows():
     rows = [
         {"slug": "openai-codex", "name": "OpenAI Codex", "models": ["gpt-5.4"],

@@ -366,6 +366,14 @@ def _normalize_preset(raw: Any) -> dict[str, Any]:
         # last advisor run. Also accepts the mapping form
         # {mode: every_n, n: N}, normalized to the canonical string.
         "fanout": _coerce_fanout(raw.get("fanout")),
+        # Shared read-only delegate node config (opt-in). Passed through
+        # unvalidated — agent/moa_loop.py's _reference_delegate_config owns
+        # the semantics (enabled flag, provider/model guard, defaults).
+        "reference_delegate": (
+            deepcopy(raw.get("reference_delegate"))
+            if isinstance(raw.get("reference_delegate"), dict)
+            else None
+        ),
     }
 
 

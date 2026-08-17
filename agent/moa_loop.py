@@ -13,6 +13,7 @@ import logging
 import re
 import threading
 import time
+import json
 from concurrent.futures import ThreadPoolExecutor, wait as _futures_wait
 from types import SimpleNamespace
 from typing import Any
@@ -477,6 +478,404 @@ def _maybe_apply_moa_cache_control(
         return messages
 
 
+_REFERENCE_DELEGATE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "delegate_task",
+        "description": (
+            "Spawn ONE read-only research subagent to verify facts, read files, "
+            "or search the web/history that you cannot see from the advisory "
+            "view. The subagent has ONLY read-only tools (file reads, web "
+            "search, session search) and CANNOT modify anything. Use it "
+            "sparingly (max 2 per turn) to ground your analysis in evidence "
+            "instead of guessing. Returns the subagent's findings as text."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "goal": {
+                    "type": "string",
+                    "description": (
+                        "What the read-only subagent should verify or find. Be "
+                        "specific and self-contained; it knows nothing about "
+                        "the conversation."
+                    ),
+                },
+                "context": {
+                    "type": "string",
+                    "description": (
+                        "Background: file paths, URLs, project structure, "
+                        "constraints. The more specific, the better."
+                    ),
+                },
+            },
+            "required": ["goal"],
+        },
+    },
+}
+
+# Toolsets a reference-spawned subagent may use. Read-only by construction:
+# file reads + web/search/session search. No write_file/patch/terminal.
+_REFERENCE_DELEGATE_TOOLSETS = ["file", "web", "search", "session_search"]
+# Hard caps so a misbehaving advisor cannot fan out unbounded cost:
+# ≤3 tool-loop rounds per reference; per-reference spawn count comes from the
+# preset's ``reference_delegate.max_per_reference`` (this constant is the
+# fallback when the block is absent).
+_REFERENCE_MAX_TOOL_ROUNDS = 3
+_REFERENCE_MAX_DELEGATES = 2
+
+# --- Shared read-only delegate node (shared_worker mode) -------------------
+#
+# Replaces the old per-reference spawn model (every advisor spawned its own
+# subagent, bounded only by a global semaphore — 2026-08-09 badcase: 4 refs ×
+# same verification goal → 5 concurrent subagents, all skipped by the cap,
+# goal text leaked into the TUI). All advisors now submit to ONE shared node:
+#
+# - A single worker executes requests serially (``max_concurrent_workers``,
+#   default 1). Requests that cannot start within ``queue_timeout_seconds``
+#   degrade to an explicit notice so the advisor answers from context instead
+#   of blocking the fan-out.
+# - Turn-scoped dedupe: submissions with identical normalized goal+context
+#   that overlap in time share ONE execution; every submitter of that request
+#   receives the same findings. Distinct requests are never merged — each
+#   result is routed back only to its own submitter(s).
+# - The child is pinned to ``reference_delegate.provider/model`` (e.g.
+#   deepseek/deepseek-v4-flash), never the advisor's model and never the MoA
+#   preset name (a virtual model → nested-MoA empty-spin bug).
+_REFERENCE_DELEGATE_DEFAULTS: dict[str, Any] = {
+    "mode": "shared_worker",
+    "max_concurrent_workers": 1,
+    "max_per_reference": 2,
+    "queue_timeout_seconds": 30.0,
+    "child_timeout_seconds": 90.0,
+    "max_iterations": 8,
+}
+
+
+def _reference_delegate_config(raw: Any) -> dict[str, Any] | None:
+    """Normalize a preset's ``reference_delegate`` block. ``None`` = disabled.
+
+    The feature is opt-in: without an ``enabled: true`` block the advisor call
+    gets no tools at all (pure advisory, the upstream behaviour).
+    """
+    if not isinstance(raw, dict) or not raw.get("enabled"):
+        return None
+    cfg: dict[str, Any] = dict(_REFERENCE_DELEGATE_DEFAULTS)
+    for key in cfg:
+        if raw.get(key) is not None:
+            cfg[key] = raw[key]
+    provider = str(raw.get("provider") or "").strip()
+    model = str(raw.get("model") or "").strip()
+    cfg["provider"] = provider or None
+    cfg["model"] = model or None
+    dedupe = raw.get("dedupe")
+    cfg["dedupe_enabled"] = not (
+        isinstance(dedupe, dict) and dedupe.get("enabled") is False
+    )
+    # A delegate node with no usable model identity would spawn a child that
+    # inherits the MoA preset name — the nested-MoA empty-spin bug. Refuse to
+    # enable rather than spawn a broken child.
+    if not cfg["provider"] or not cfg["model"]:
+        logger.warning(
+            "MoA reference_delegate enabled but provider/model missing; disabling"
+        )
+        return None
+    return cfg
+
+
+class _SharedDelegateNode:
+    """Process-wide shared read-only research node for MoA reference advisors.
+
+    See the design comment above ``_REFERENCE_DELEGATE_DEFAULTS``. Results are
+    routed per submission: a follower only ever receives the result of the
+    request it actually submitted (shared execution when deduped), never a
+    broadcast of some other advisor's question.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._inflight: dict[str, dict[str, Any]] = {}
+        self._worker_sem = threading.BoundedSemaphore(1)
+
+    @staticmethod
+    def _dedupe_key(goal: str, context: str | None) -> str:
+        import re as _re
+
+        return _re.sub(r"\s+", " ", f"{goal}\n{context or ''}").strip().lower()
+
+    def submit(
+        self,
+        *,
+        goal: str,
+        context: str | None,
+        parent_agent: Any,
+        slot_label: str,
+        cfg: dict[str, Any],
+        event: dict,
+    ) -> str:
+        """Run (or join) one read-only research request; return findings text.
+
+        Never raises — every failure path returns an explicit degraded note so
+        the advisor keeps answering from its own context.
+        """
+        import time as _time
+
+        key = (
+            self._dedupe_key(goal, context)
+            if cfg.get("dedupe_enabled", True)
+            else f"unique:{id(object())}:{slot_label}"
+        )
+        with self._lock:
+            entry = self._inflight.get(key)
+            if entry is None:
+                entry = {"event": threading.Event(), "result": None}
+                self._inflight[key] = entry
+                leader = True
+            else:
+                leader = False
+
+        if not leader:
+            # Identical in-flight request: wait for the shared execution and
+            # receive the same findings. Wait budget covers the leader's own
+            # queue wait plus its child run; on expiry we degrade rather than
+            # stall this advisor's whole turn.
+            wait_budget = float(cfg["queue_timeout_seconds"]) + float(
+                cfg["child_timeout_seconds"]
+            )
+            if entry["event"].wait(timeout=wait_budget):
+                event["status"] = event.get("status") or "completed"
+                event["dedupe_shared"] = True
+                return str(entry["result"])
+            event["status"] = "skipped"
+            event["skipped_reason"] = "shared_wait_timeout"
+            return (
+                "[reference subagent unavailable: shared read-only node did "
+                "not answer in time — answer from the evidence already in "
+                "your context; do not present this request as verified]"
+            )
+
+        result: str = (
+            "[reference subagent unavailable: internal scheduling error — "
+            "answer from the evidence already in your context]"
+        )
+        try:
+            acquired = self._worker_sem.acquire(
+                timeout=float(cfg["queue_timeout_seconds"])
+            )
+            if not acquired:
+                event["status"] = "skipped"
+                event["skipped_reason"] = "queue_timeout"
+                result = (
+                    "[reference subagent unavailable: shared read-only node "
+                    "busy — answer from the evidence already in your context; "
+                    "do not present this request as verified]"
+                )
+            else:
+                try:
+                    result = self._run_child(
+                        goal=goal,
+                        context=context,
+                        parent_agent=parent_agent,
+                        slot_label=slot_label,
+                        cfg=cfg,
+                        event=event,
+                    )
+                except Exception as exc:  # never kill the fan-out
+                    logger.warning("MoA reference delegate failed: %s", exc)
+                    event["status"] = "error"
+                    event["error"] = str(exc)[:500]
+                    result = f"[reference subagent failed: {exc}]"
+                finally:
+                    self._worker_sem.release()
+        finally:
+            # Publish to any followers waiting on this deduped request, THEN
+            # drop the inflight entry so the next identical request re-runs.
+            entry["result"] = result
+            entry["event"].set()
+            with self._lock:
+                if self._inflight.get(key) is entry:
+                    self._inflight.pop(key, None)
+        return result
+
+    def _run_child(
+        self,
+        *,
+        goal: str,
+        context: str | None,
+        parent_agent: Any,
+        slot_label: str,
+        cfg: dict[str, Any],
+        event: dict,
+    ) -> str:
+        """Execute the read-only child and store the result on the inflight entry."""
+        from tools.delegate_tool import _build_child_agent, _run_child_lifecycle
+
+        import time as _time
+
+        _start = _time.monotonic()
+        # Resolve the CONFIGURED delegate model (not the advisor's slot) to
+        # real call kwargs — provider/base_url/api_key/api_mode. This is what
+        # prevents the child from inheriting the virtual MoA preset name.
+        runtime = _slot_runtime({"provider": cfg["provider"], "model": cfg["model"]})
+        child = _build_child_agent(
+            task_index=0,
+            goal=goal,
+            context=context,
+            toolsets=_REFERENCE_DELEGATE_TOOLSETS,
+            model=runtime.get("model") or cfg["model"],
+            max_iterations=int(cfg["max_iterations"]),
+            task_count=1,
+            parent_agent=parent_agent,
+            role="leaf",
+            override_provider=runtime.get("provider"),
+            override_base_url=runtime.get("base_url"),
+            override_api_key=runtime.get("api_key"),
+            override_api_mode=runtime.get("api_mode"),
+        )
+        result = _run_child_lifecycle(
+            task_index=0,
+            goal=goal,
+            child=child,
+            parent_agent=parent_agent,
+        )
+        output = ""
+        if isinstance(result, dict):
+            event["status"] = str(result.get("status") or "")
+            event["exit_reason"] = result.get("exit_reason")
+            event["api_calls"] = result.get("api_calls")
+            event["model"] = result.get("model")
+            event["duration_seconds"] = result.get("duration_seconds") or round(
+                _time.monotonic() - _start, 3
+            )
+            tok = result.get("tokens") or {}
+            event["tokens"] = tok if isinstance(tok, dict) else None
+            tt = result.get("tool_trace") or []
+            if isinstance(tt, list):
+                # Only report tools that actually exist in this process's
+                # registry — tool_trace can carry hallucinated names (seen:
+                # "Glob"/"PowerShell") that would corrupt usage statistics.
+                try:
+                    from tools.registry import registry
+
+                    known = set(registry.get_all_tool_names())
+                except Exception:  # pragma: no cover - defensive
+                    known = set()
+                if known:
+                    event["tools_used"] = sorted(
+                        {
+                            str(t.get("tool"))
+                            for t in tt
+                            if isinstance(t, dict) and t.get("tool") in known
+                        }
+                    )
+                else:
+                    event["tools_used"] = sorted(
+                        {str(t.get("tool")) for t in tt if isinstance(t, dict)}
+                    )
+            output = result.get("output") or result.get("summary") or ""
+            if isinstance(output, str):
+                event["output_chars"] = len(output)
+            if result.get("success") and output.strip():
+                return output.strip()
+        event["status"] = event["status"] or "no_output"
+        return "[reference subagent returned no readable output]"
+
+
+_shared_delegate_node = _SharedDelegateNode()
+
+
+def _record_reference_delegate_event(entry: dict) -> None:
+    """Append one JSONL event for a reference-spawned subagent run.
+
+    This is the telemetry backbone for later evaluation ("did the read-only
+    reference subagent actually help?"). One line per delegate run under
+    ``~/.hermes/logs/moa-reference-delegates.jsonl``, capturing everything
+    needed to judge usefulness and cost without re-running the system:
+    advisor slot, goal, outcome (completed/failed/skipped), duration, API
+    calls, token counts, tool trace, and the returned text length. Append-only,
+    never rotated, best-effort (a write failure must not break the fan-out).
+    """
+    try:
+        from hermes_constants import get_hermes_home
+
+        path = get_hermes_home() / "logs" / "moa-reference-delegates.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+    except Exception as exc:  # pragma: no cover - telemetry must never break MoA
+        logger.debug("MoA reference delegate telemetry write failed: %s", exc)
+
+
+def _execute_reference_delegate(
+    goal: str,
+    context: str | None,
+    parent_agent: Any,
+    slot_label: str = "",
+    delegate_cfg: dict[str, Any] | None = None,
+) -> str:
+    """Submit ONE read-only research request to the shared delegate node.
+
+    Thin wrapper over ``_SharedDelegateNode.submit``: builds the telemetry
+    event, routes through the shared worker (turn-scoped dedupe, single
+    serial execution, per-submitter result routing), and records telemetry.
+    The child model comes from ``delegate_cfg`` (the preset's
+    ``reference_delegate.provider/model``) — never the advisor's slot, never
+    the MoA preset name (a virtual model → nested-MoA empty-spin bug).
+
+    Never raises: every failure path returns an explicit degraded note so the
+    advisor keeps answering from its own context.
+    """
+    cfg = delegate_cfg or {}
+    event: dict = {
+        "ts": None,
+        "slot": slot_label,
+        "goal": goal[:500],
+        "status": None,
+        "duration_seconds": None,
+        "api_calls": None,
+        "tokens": None,
+        "model": cfg.get("model"),
+        "exit_reason": None,
+        "tools_used": None,
+        "output_chars": None,
+        "skipped_reason": None,
+        "dedupe_shared": False,
+        "error": None,
+    }
+    import time as _time
+
+    _start = _time.monotonic()
+    try:
+        event["ts"] = _time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        return _shared_delegate_node.submit(
+            goal=goal,
+            context=context,
+            parent_agent=parent_agent,
+            slot_label=slot_label,
+            cfg=cfg,
+            event=event,
+        )
+    except Exception as exc:  # pragma: no cover - outermost guard
+        logger.warning("MoA reference delegate failed (outer): %s", exc)
+        event["status"] = "error"
+        event["error"] = str(exc)[:500]
+        return f"[reference subagent failed: {exc}]"
+    finally:
+        if event.get("duration_seconds") is None:
+            event["duration_seconds"] = round(_time.monotonic() - _start, 3)
+        _record_reference_delegate_event(event)
+
+
+def _strip_model_hidden_tool_fields(tools: list[dict]) -> list[dict]:
+    """Remove model-facing-only fields from delegate_task tool definitions.
+
+    The reference-injected ``delegate_task`` schema is built for the advisor's
+    eyes (goal/context). Nothing else is hidden for now — kept as a helper so
+    future hidden fields (e.g. a pinned toolsets) have one choke point.
+    """
+    return tools
+
+
 def _run_reference(
     slot: dict[str, Any],
     ref_messages: list[dict[str, Any]],
@@ -487,6 +886,8 @@ def _run_reference(
     context_length_cache: Any = None,
     cache_disabled: bool | None = None,
     cache_ttl: str | None = None,
+    parent_agent: Any = None,
+    delegate_cfg: dict[str, Any] | None = None,
 ) -> tuple[str, str, Any]:
     """Call one reference model and return ``(label, text, accounting)``.
 
@@ -580,16 +981,82 @@ def _run_reference(
             # ``copilot-language-server`` integrator even though standalone
             # Copilot calls work.
             extra_headers = {"x-initiator": "user"}
-        response = call_llm(
-            task="moa_reference",
-            messages=messages,
-            temperature=temperature,
-            max_tokens=_effective_max_tokens,
-            timeout=reference_timeout,
-            reasoning_config=_slot_reasoning_config(slot),
-            extra_headers=extra_headers,
-            **runtime,
-        )
+        # Reference advisors are advisory — they have NO direct tools. When the
+        # preset enables ``reference_delegate`` AND a parent agent is available
+        # (MoA runs inside a real agent turn), inject ONE restricted tool —
+        # delegate_task — whose requests route to the shared read-only node
+        # (``_SharedDelegateNode``): single serial worker, turn-scoped dedupe,
+        # per-submitter result routing. Caps: ≤3 rounds and
+        # ``max_per_reference`` spawns per reference, so a misbehaving advisor
+        # cannot fan out cost. Without the config block the call stays a pure
+        # advisory text call (upstream behaviour).
+        tools = None
+        if parent_agent is not None and delegate_cfg is not None:
+            tools = [_REFERENCE_DELEGATE_TOOL]
+        tool_round = 0
+        delegates_used = 0
+        while True:
+            response = call_llm(
+                task="moa_reference",
+                messages=messages,
+                temperature=temperature,
+                max_tokens=_effective_max_tokens,
+                timeout=reference_timeout,
+                reasoning_config=_slot_reasoning_config(slot),
+                extra_headers=extra_headers,
+                tools=tools,
+                **runtime,
+            )
+            raw_tool_calls = getattr(response, "tool_calls", None)
+            if raw_tool_calls is None:
+                # Some transports normalize into choices[0].message.tool_calls.
+                try:
+                    raw_tool_calls = response.choices[0].message.tool_calls
+                except Exception:
+                    raw_tool_calls = None
+            max_delegates = int(
+                (delegate_cfg or {}).get("max_per_reference")
+                or _REFERENCE_MAX_DELEGATES
+            )
+            if not raw_tool_calls or tool_round >= _REFERENCE_MAX_TOOL_ROUNDS or delegates_used >= max_delegates:
+                break
+            tool_round += 1
+            # Execute each requested delegate_task call and append results.
+            for tc in raw_tool_calls:
+                fn = getattr(tc, "function", None)
+                fn_name = getattr(fn, "name", None) if fn is not None else None
+                if fn_name != "delegate_task":
+                    continue
+                args_text = getattr(fn, "arguments", None)
+                try:
+                    args = json.loads(args_text) if isinstance(args_text, str) else (args_text or {})
+                except Exception:
+                    args = {}
+                goal = str(args.get("goal") or "").strip()
+                if not goal:
+                    continue
+                delegates_used += 1
+                result_text = _execute_reference_delegate(
+                    goal,
+                    args.get("context"),
+                    parent_agent,
+                    slot_label=label,
+                    delegate_cfg=delegate_cfg,
+                )
+                messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{"id": "ref-delegate", "type": "function", "function": {"name": "delegate_task", "arguments": args_text or "{}"}}],
+                })
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": "ref-delegate",
+                    "content": result_text,
+                })
+            if not messages or messages[-1].get("role") != "tool":
+                # No executable delegate_task call in this round — avoid an
+                # infinite loop of unparseable tool_calls.
+                break
         usage = CanonicalUsage()
         raw_usage = getattr(response, "usage", None)
         if raw_usage:
@@ -802,6 +1269,7 @@ def _run_references_parallel(
     reference_timeout: float | None = None,
     agent: Any = None,
     late_accounting_sink: Any = None,
+    delegate_cfg: dict[str, Any] | None = None,
 ) -> list[tuple[str, str, Any]]:
     """Fan out all reference models in parallel, returning outputs in order.
 
@@ -886,6 +1354,8 @@ def _run_references_parallel(
                     context_length_cache=_ctx_len_cache,
                     cache_disabled=cache_disabled,
                     cache_ttl=cache_ttl,
+                    parent_agent=agent,
+                    delegate_cfg=delegate_cfg,
                 )
             ] = idx
 
@@ -961,14 +1431,48 @@ def _run_references_parallel(
     return [r for r in results if r is not None]
 
 
+def _strip_ansi_control(text: str) -> str:
+    """Strip ANSI escape sequences and terminal control characters from tool output.
+
+    Terminal output routinely carries CSI/OSC escape sequences (color codes,
+    cursor movement, ``\x1b]0;title``) and raw control characters (bell,
+    backspace, etc.). When such output is folded verbatim into the advisory
+    view, references receive byte-garbage and echo it back — the "tool output
+    corrupted" artifact. This strips:
+      - CSI sequences: ``ESC [ ... final-byte`` (colors, cursor, erase)
+      - OSC sequences: ``ESC ] ... BEL`` / ``ESC ] ... ESC \\`` (titles)
+      - 2-char escapes: ``ESC ( X`` etc. (charset selection)
+      - lone ESC and other C0 control chars (0x00-0x1F except TAB/LF/CR)
+      - DEL (0x7F)
+    """
+    import re
+
+    if not text:
+        return text
+    # CSI: ESC [ params? intermediates? final (0x40-0x7E)
+    text = re.sub(r"\x1b\[[0-9;:]*[ -/]*[@-~]", "", text)
+    # OSC: ESC ] ... terminated by BEL or ESC \
+    text = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)", "", text)
+    # 2-char escapes: ESC ( X / ESC ) X / ESC # X / ESC % X etc.
+    text = re.sub(r"\x1b[()#%][0-9A-Za-z]", "", text)
+    # Lone ESC + remaining C0 controls (keep \t \n \r), DEL
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x1b\x7f]", "", text)
+    return text
+
+
 def _truncate_tool_result(text: str, budget: int = _REFERENCE_TOOL_RESULT_BUDGET) -> str:
     """Head+tail preview of a tool result for the advisory view.
 
     Keeps the first and last halves of the budget with a ``[... N chars
     omitted ...]`` marker between them, so a reference sees both how the result
-    started and how it ended without replaying the whole payload.
+    started and how it ended without replaying the whole payload. ANSI escape
+    sequences and control characters are stripped first so references never
+    receive (or echo back) terminal byte-garbage.
     """
-    if not text or len(text) <= budget:
+    if not text:
+        return text
+    text = _strip_ansi_control(text)
+    if len(text) <= budget:
         return text
     half = budget // 2
     omitted = len(text) - 2 * half
@@ -1165,6 +1669,32 @@ def _extract_text(response: Any) -> str:
             return text
     except Exception:
         pass
+    # Anthropic Messages wire (e.g. kimi-coding fallback): content is a list
+    # of blocks ({"type": "text", "text": ...}) or a plain string; there is
+    # no choices[0].message. Without this branch, a reference that fell back
+    # to an Anthropic-wire provider resolved to "" and the MoA turn silently
+    # lost that advisor's output (the "reference N output was empty" artifact).
+    try:
+        content = getattr(response, "content", None)
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, (list, tuple)):
+            parts: list[str] = []
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "text":
+                        parts.append(str(block.get("text") or ""))
+                    elif block.get("text"):  # lenient: some relays omit type
+                        parts.append(str(block["text"]))
+                else:
+                    txt = getattr(block, "text", None) or getattr(block, "content", None)
+                    if txt:
+                        parts.append(str(txt))
+            joined = "".join(parts).strip()
+            if joined:
+                return joined
+    except Exception:
+        pass
     try:
         message = response.choices[0].message
         if isinstance(message, dict):
@@ -1242,6 +1772,7 @@ def aggregate_moa_context(
     reference_timeout: float | None = None,
     degraded_reference_policy: str = "loud",
     agent: Any = None,
+    reference_delegate: dict[str, Any] | None = None,
 ) -> str:
     """Run configured reference models and synthesize their advice.
 
@@ -1275,6 +1806,7 @@ def aggregate_moa_context(
         max_tokens=reference_max_tokens,
         reference_timeout=reference_timeout,
         agent=agent,
+        delegate_cfg=_reference_delegate_config(reference_delegate),
     )
 
     successful_outputs = _successful_references(reference_outputs)
@@ -1933,6 +2465,9 @@ class MoAChatCompletions:
                 with _preset_cache_lock:
                     _preset_cache.clear()  # one live config stamp at a time
                     _preset_cache[preset_cache_key] = preset
+        # Shared read-only delegate node config (opt-in per preset). Parsed
+        # once per turn alongside the preset; None = advisors get no tools.
+        delegate_cfg = _reference_delegate_config(preset.get("reference_delegate"))
         # Privacy filter mode: '' (off, default) | 'display' | 'full'. See
         # coerce_privacy_filter / the pattern block at the top of this module.
         # Remembered on self so _call_prepared_aggregator (which may run on a
@@ -2126,6 +2661,7 @@ class MoAChatCompletions:
                 reference_timeout=reference_timeout,
                 agent=self._agent,
                 late_accounting_sink=self._record_late_reference_accounting,
+                delegate_cfg=delegate_cfg,
             )
             interrupted_any = any(
                 text == _INTERRUPTED_REFERENCE_NOTE

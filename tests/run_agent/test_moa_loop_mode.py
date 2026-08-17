@@ -1336,3 +1336,502 @@ def test_render_tool_calls_tolerates_namespace_shapes():
 
     # Degenerate shapes still fall back safely.
     assert _render_tool_calls([SimpleNamespace()]) == "[called tool: tool]"
+
+
+# --- ANSI/control-char stripping in the advisory tool-result view ---
+
+
+def test_strip_ansi_control_removes_csi_color_sequences():
+    from agent import moa_loop
+
+    dirty = "\x1b[31mred\x1b[0m \x1b[1mbold\x1b[22m plain"
+    clean = moa_loop._strip_ansi_control(dirty)
+    assert clean == "red bold plain"
+    assert "\x1b" not in clean
+
+
+def test_strip_ansi_control_removes_osc_title_and_charset_escapes():
+    from agent import moa_loop
+
+    dirty = "\x1b]0;tmux title\x07body\x1b(B\x1b)0tail"
+    clean = moa_loop._strip_ansi_control(dirty)
+    assert "title" not in clean
+    assert "body" in clean
+    assert "tail" in clean
+    assert "\x1b" not in clean
+
+
+def test_strip_ansi_control_keeps_tab_lf_cr_and_unicode():
+    from agent import moa_loop
+
+    dirty = "a\tb\nc\rd 中文 e\x07f\x1bg"
+    clean = moa_loop._strip_ansi_control(dirty)
+    assert clean == "a\tb\nc\rd 中文 efg"
+
+
+def test_truncate_tool_result_strips_ansi_before_budget():
+    from agent import moa_loop
+
+    # ANSI-stuffed output that would exceed the budget only because of escapes.
+    colored = ("\x1b[32m" + "x" * 100 + "\x1b[0m") * 60  # 6120 raw chars
+    out = moa_loop._truncate_tool_result(colored, budget=2000)
+    assert "\x1b" not in out
+    # 6000 clean chars, budget 2000 → half=1000 head + half=1000 tail,
+    # omitted = 6000-2000 = 4000, marker carries the real count.
+    marker = "[... 4000 chars omitted ...]"
+    assert len(out) == 2000 + len(marker) + 2
+    assert marker in out
+
+
+def test_truncate_tool_result_plain_text_unchanged():
+    from agent import moa_loop
+
+    plain = "just text, no escapes\nsecond line"
+    assert moa_loop._truncate_tool_result(plain) == plain
+
+
+# --- Anthropic-wire response extraction (fallback reference output) ---
+
+
+def test_extract_text_handles_anthropic_block_list():
+    from agent import moa_loop
+    from types import SimpleNamespace
+
+    # kimi-coding / Anthropic Messages wire shape: content = list of blocks.
+    resp = SimpleNamespace(
+        content=[{"type": "text", "text": "advice part one"}, {"type": "text", "text": " part two"}],
+        usage=None, model="kimi-k3",
+    )
+    assert moa_loop._extract_text(resp) == "advice part one part two"
+
+
+def test_extract_text_handles_anthropic_plain_string_content():
+    from agent import moa_loop
+    from types import SimpleNamespace
+
+    resp = SimpleNamespace(content="plain advice", usage=None, model="kimi-k3")
+    assert moa_loop._extract_text(resp) == "plain advice"
+
+
+def test_extract_text_handles_anthropic_block_objects():
+    from agent import moa_loop
+    from types import SimpleNamespace
+
+    block = SimpleNamespace(type="text", text="object block advice")
+    resp = SimpleNamespace(content=[block], usage=None, model="kimi-k3")
+    assert moa_loop._extract_text(resp) == "object block advice"
+
+
+def test_extract_text_still_handles_openai_shape():
+    from agent import moa_loop
+
+    assert moa_loop._extract_text(_response("openai advice")) == "openai advice"
+
+
+# --- Reference read-only delegate loop (parent_agent → restricted subagent) ---
+
+
+def _make_ref_agent():
+    """Minimal parent-agent stand-in for _run_reference tool-loop tests."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        _delegate_depth=0,
+        _cache_disabled=None,
+        model="test-model",
+        enabled_toolsets=None,
+        valid_tool_names=["read_file", "write_file", "web_search"],
+        _delegate_spinner=None,
+        tool_progress_callback=None,
+        _safe_print=lambda *a, **k: None,
+        _subagent_id=None,
+        _subdirectory_hints=None,
+        terminal_cwd="/tmp",
+        cwd="/tmp",
+        _client_kwargs=None,
+        client=None,
+        base_url=None,
+        prefill_messages=None,
+        fallback_model=None,
+        _agent_interrupt_requested=lambda: False,
+        _cache_disabled_value=None,
+    )
+
+
+def test_reference_tool_loop_injects_delegate_tool_and_executes(monkeypatch):
+    """When a parent agent is present, the reference call carries ONE
+    restricted tool (delegate_task), and a tool_call round spawns the
+    read-only subagent and feeds its findings back before the final text."""
+    import json
+
+    from agent import moa_loop
+
+    calls = []
+
+    def fake_call_llm(**kwargs):
+        calls.append(kwargs)
+        n = len(calls)
+        if n == 1:
+            # First round: advisor asks for evidence.
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(
+                    content=None,
+                    tool_calls=[SimpleNamespace(
+                        id="call-1", type="function",
+                        function=SimpleNamespace(
+                            name="delegate_task",
+                            arguments=json.dumps({"goal": "verify the claim", "context": "file: /tmp/x"}),
+                        ),
+                    )],
+                ))],
+                usage=None,
+            )
+        # Second round: advisor gives its final advice.
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="grounded advice", tool_calls=[]))],
+            usage=None,
+        )
+
+    captured = {}
+
+    def fake_delegate(goal, context, parent_agent, slot_label="", delegate_cfg=None):
+        captured["goal"] = goal
+        captured["context"] = context
+        captured["parent"] = parent_agent
+        captured["slot_label"] = slot_label
+        captured["delegate_cfg"] = delegate_cfg
+        return "findings: the claim holds"
+
+    monkeypatch.setattr(moa_loop, "call_llm", fake_call_llm)
+    monkeypatch.setattr(moa_loop, "_execute_reference_delegate", fake_delegate)
+    monkeypatch.setattr(moa_loop, "get_transport", lambda *_a, **_k: None)
+
+    agent = _make_ref_agent()
+    slot = {"provider": "p1", "model": "m1"}
+    cfg = moa_loop._reference_delegate_config(
+        {"enabled": True, "provider": "deepseek", "model": "deepseek-v4-flash"}
+    )
+    label, text, acct = moa_loop._run_reference(
+        slot,
+        [{"role": "user", "content": "advise me"}],
+        max_tokens=64,
+        parent_agent=agent,
+        delegate_cfg=cfg,
+    )
+
+    # Tool injected on both rounds.
+    assert all(kwargs.get("tools") == [moa_loop._REFERENCE_DELEGATE_TOOL] for kwargs in calls)
+    # The delegate executed with the goal/context from the tool_call.
+    assert captured["goal"] == "verify the claim"
+    assert captured["parent"] is agent
+    assert captured["slot_label"] == "p1:m1"
+    # The delegate config is passed through so the child is pinned to the
+    # CONFIGURED read-only model — not the advisor's slot, not the MoA preset.
+    assert captured["delegate_cfg"]["provider"] == "deepseek"
+    assert captured["delegate_cfg"]["model"] == "deepseek-v4-flash"
+    # Final output is the advisor's grounded text.
+    assert text == "grounded advice"
+    assert label == "p1:m1"
+
+
+def test_reference_without_parent_agent_sends_no_tools(monkeypatch):
+    """No parent agent → no tool injection (advisory-only reference, unchanged)."""
+    from agent import moa_loop
+
+    seen = {}
+
+    def fake_call_llm(**kwargs):
+        seen["tools"] = kwargs.get("tools")
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="advice", tool_calls=[]))],
+            usage=None,
+        )
+
+    monkeypatch.setattr(moa_loop, "call_llm", fake_call_llm)
+    monkeypatch.setattr(moa_loop, "get_transport", lambda *_a, **_k: None)
+
+    label, text, _ = moa_loop._run_reference(
+        {"provider": "p1", "model": "m1"},
+        [{"role": "user", "content": "hi"}],
+        max_tokens=64,
+        parent_agent=None,
+    )
+    assert seen["tools"] is None
+    assert text == "advice"
+
+
+def test_reference_tool_loop_caps_rounds(monkeypatch):
+    """A reference that keeps asking for delegates is cut off after the cap."""
+    import json
+
+    from agent import moa_loop
+
+    calls = []
+
+    def fake_call_llm(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content=None,
+                tool_calls=[SimpleNamespace(
+                    id=f"call-{len(calls)}", type="function",
+                    function=SimpleNamespace(
+                        name="delegate_task",
+                        arguments=json.dumps({"goal": "more evidence"}),
+                    ),
+                )],
+            ))],
+            usage=None,
+        )
+
+    monkeypatch.setattr(moa_loop, "call_llm", fake_call_llm)
+    monkeypatch.setattr(moa_loop, "_execute_reference_delegate", lambda *a, **k: "findings")
+    monkeypatch.setattr(moa_loop, "get_transport", lambda *_a, **_k: None)
+
+    label, text, _ = moa_loop._run_reference(
+        {"provider": "p1", "model": "m1"},
+        [{"role": "user", "content": "hi"}],
+        max_tokens=64,
+        parent_agent=_make_ref_agent(),
+        delegate_cfg=moa_loop._reference_delegate_config(
+            {"enabled": True, "provider": "deepseek", "model": "deepseek-v4-flash"}
+        ),
+    )
+
+    # 1 initial + cap rounds = _REFERENCE_MAX_TOOL_ROUNDS + 1 calls max.
+    assert len(calls) <= moa_loop._REFERENCE_MAX_TOOL_ROUNDS + 1
+    assert text == "(empty response)"
+
+
+def test_reference_delegate_uses_configured_child_model_and_filters_tools(monkeypatch, tmp_path):
+    """The delegate child is pinned to the preset's ``reference_delegate``
+    provider/model — never the advisor's slot, never the MoA preset name;
+    tools_used only reports registry-known tools."""
+    from agent import moa_loop
+    import tools.delegate_tool as delegate_tool
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    captured = {}
+
+    class FakeChild:
+        model = "deepseek-v4-flash"
+
+    def fake_build(task_index, goal, context, toolsets, model, max_iterations,
+                   task_count, parent_agent, role="leaf", **override_kwargs):
+        captured["build_kwargs"] = {
+            "model": model,
+            "toolsets": toolsets,
+            "overrides": {k: v for k, v in override_kwargs.items()},
+        }
+        return FakeChild()
+
+    def fake_lifecycle(task_index, goal, child=None, parent_agent=None):
+        assert child is not None
+        return {
+            "status": "completed",
+            "exit_reason": "completed",
+            "api_calls": 2,
+            "model": child.model,
+            "duration_seconds": 1.0,
+            "tokens": {"input": 100, "output": 50},
+            "tool_trace": [
+                {"tool": "search_files"},
+                {"tool": "Glob"},  # hallucinated — must be filtered
+                {"tool": "PowerShell"},  # hallucinated — must be filtered
+            ],
+            "output": "verified",
+            "success": True,
+        }
+
+    monkeypatch.setattr(delegate_tool, "_build_child_agent", fake_build)
+    monkeypatch.setattr(delegate_tool, "_run_child_lifecycle", fake_lifecycle)
+    # The CONFIGURED delegate model resolves to real credentials.
+    monkeypatch.setattr(
+        moa_loop, "_slot_runtime",
+        lambda slot: {
+            "provider": slot["provider"], "model": slot["model"],
+            "base_url": "https://api.deepseek.com", "api_key": "sk-test",
+            "api_mode": "chat_completions",
+        },
+    )
+
+    cfg = moa_loop._reference_delegate_config(
+        {"enabled": True, "provider": "deepseek", "model": "deepseek-v4-flash"}
+    )
+    out = moa_loop._execute_reference_delegate(
+        "verify", None, parent_agent=None, slot_label="kimi-coding:k3-256k",
+        delegate_cfg=cfg)
+
+    assert out == "verified"
+    b = captured["build_kwargs"]
+    # Pinned to the configured read-only model — NOT the advisor's slot
+    # (kimi-coding:k3-256k) and NOT the virtual MoA preset name.
+    assert b["model"] == "deepseek-v4-flash"
+    assert b["overrides"]["override_provider"] == "deepseek"
+    assert b["overrides"]["override_base_url"] == "https://api.deepseek.com"
+    assert b["overrides"]["override_api_key"] == "sk-test"
+    assert b["toolsets"] == ["file", "web", "search", "session_search"]
+
+    # Telemetry: slot = submitter, model = the configured child model.
+    import json
+    log = home / "logs" / "moa-reference-delegates.jsonl"
+    events = [json.loads(l) for l in log.read_text().splitlines() if l.strip()]
+    assert len(events) == 1
+    ev = events[0]
+    assert ev["status"] == "completed"
+    assert ev["slot"] == "kimi-coding:k3-256k"
+    assert ev["model"] == "deepseek-v4-flash"
+    assert ev["tools_used"] == ["search_files"]
+
+
+def test_reference_delegate_shared_node_queue_timeout(monkeypatch):
+    """Shared node busy beyond queue_timeout → explicit degraded note, the
+    advisor keeps answering from its own context (no silent stall)."""
+    from agent import moa_loop
+
+    calls = {"n": 0}
+
+    def fake_acquire(timeout=0):
+        calls["n"] += 1
+        return False  # worker busy
+
+    monkeypatch.setattr(
+        moa_loop._shared_delegate_node._worker_sem, "acquire", fake_acquire
+    )
+
+    cfg = moa_loop._reference_delegate_config(
+        {"enabled": True, "provider": "deepseek", "model": "deepseek-v4-flash"}
+    )
+    out = moa_loop._execute_reference_delegate(
+        "verify", None, parent_agent=None, delegate_cfg=cfg)
+    assert "shared read-only node busy" in out
+    assert calls["n"] == 1
+
+
+# --- Shared delegate node: dedupe, routing, config parsing -----------------
+
+
+def test_reference_delegate_config_parsing():
+    """The feature is opt-in; missing model identity is refused (it would
+    spawn a child inheriting the virtual MoA preset name)."""
+    from agent import moa_loop
+
+    assert moa_loop._reference_delegate_config(None) is None
+    assert moa_loop._reference_delegate_config({}) is None
+    assert moa_loop._reference_delegate_config(
+        {"enabled": False, "provider": "deepseek", "model": "m"}
+    ) is None
+    # Missing model identity → refused (nested-MoA guard).
+    assert moa_loop._reference_delegate_config(
+        {"enabled": True, "provider": "deepseek"}
+    ) is None
+    cfg = moa_loop._reference_delegate_config(
+        {"enabled": True, "provider": "deepseek", "model": "deepseek-v4-flash"}
+    )
+    assert cfg is not None
+    assert cfg["provider"] == "deepseek"
+    assert cfg["model"] == "deepseek-v4-flash"
+    assert cfg["max_concurrent_workers"] == 1
+    assert cfg["dedupe_enabled"] is True
+
+
+def test_shared_delegate_dedupes_identical_requests(monkeypatch):
+    """Two concurrent identical submissions share ONE child execution; both
+    submitters receive the same findings for THEIR request."""
+    import threading
+    import time
+
+    from agent import moa_loop
+
+    node = moa_loop._SharedDelegateNode()
+    runs = {"n": 0}
+    started = threading.Event()
+
+    def fake_run_child(self, *, goal, context, parent_agent, slot_label, cfg, event):
+        runs["n"] += 1
+        started.set()
+        time.sleep(0.2)  # hold the worker so the follower joins mid-run
+        event["status"] = "completed"
+        return "findings: 42"
+
+    monkeypatch.setattr(moa_loop._SharedDelegateNode, "_run_child", fake_run_child)
+    cfg = moa_loop._reference_delegate_config(
+        {"enabled": True, "provider": "deepseek", "model": "deepseek-v4-flash"}
+    )
+
+    results = {}
+
+    def submit(slot):
+        results[slot] = node.submit(
+            goal="verify X", context=None, parent_agent=None,
+            slot_label=slot, cfg=cfg, event={},
+        )
+
+    t1 = threading.Thread(target=submit, args=("refA",))
+    t2 = threading.Thread(target=submit, args=("refB",))
+    t1.start()
+    assert started.wait(timeout=2)
+    t2.start()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+
+    assert runs["n"] == 1  # one execution only
+    assert results["refA"] == "findings: 42"
+    assert results["refB"] == "findings: 42"
+
+
+def test_shared_delegate_routes_distinct_requests_separately(monkeypatch):
+    """Distinct goals are never merged: each executes and returns to its own
+    submitter only."""
+    from agent import moa_loop
+
+    node = moa_loop._SharedDelegateNode()
+    seen = []
+
+    def fake_run_child(self, *, goal, context, parent_agent, slot_label, cfg, event):
+        seen.append(goal)
+        return f"findings for {goal}"
+
+    monkeypatch.setattr(moa_loop._SharedDelegateNode, "_run_child", fake_run_child)
+    cfg = moa_loop._reference_delegate_config(
+        {"enabled": True, "provider": "deepseek", "model": "deepseek-v4-flash"}
+    )
+
+    r1 = node.submit(goal="goal A", context=None, parent_agent=None,
+                     slot_label="refA", cfg=cfg, event={})
+    r2 = node.submit(goal="goal B", context=None, parent_agent=None,
+                     slot_label="refB", cfg=cfg, event={})
+    assert r1 == "findings for goal A"
+    assert r2 == "findings for goal B"
+    assert seen == ["goal A", "goal B"]
+
+
+def test_reference_without_delegate_config_sends_no_tools(monkeypatch):
+    """parent_agent present but reference_delegate NOT configured → no tools
+    (pure advisory, upstream behaviour)."""
+    from agent import moa_loop
+
+    seen = {}
+
+    def fake_call_llm(**kwargs):
+        seen["tools"] = kwargs.get("tools")
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="advice", tool_calls=[]))],
+            usage=None,
+        )
+
+    monkeypatch.setattr(moa_loop, "call_llm", fake_call_llm)
+    monkeypatch.setattr(moa_loop, "get_transport", lambda *_a, **_k: None)
+
+    label, text, _ = moa_loop._run_reference(
+        {"provider": "p1", "model": "m1"},
+        [{"role": "user", "content": "hi"}],
+        max_tokens=64,
+        parent_agent=_make_ref_agent(),
+        delegate_cfg=None,
+    )
+    assert seen["tools"] is None
+    assert text == "advice"

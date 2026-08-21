@@ -22,7 +22,20 @@ import { useComposerAttachmentProviders } from './contrib'
 import { GHOST_ICON_BTN } from './controls'
 import type { ChatBarState } from './types'
 
-const SNIPPET_KEYS = ['codeReview', 'implementationPlan', 'explainThis']
+const SNIPPET_KEYS = [
+  'socraticQuestioning',
+  'dualLayerExplanation',
+  'reverseDeconstruction',
+  'crossLongitudinalAnalysis',
+  'factCheck',
+  'expertConsultation',
+  'firstPrinciples',
+  'crossDomainTransfer',
+  'dualSteelman',
+  'minimalExperiment',
+  'hiddenTalent',
+  'lifeDesign',
+]
 
 export function ContextMenu({
   state,

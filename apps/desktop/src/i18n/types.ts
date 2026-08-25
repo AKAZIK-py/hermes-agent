@@ -2034,6 +2034,16 @@ export interface Translations {
     tipPost: string
     snippetsTitle: string
     snippetsDesc: string
+    snippetsAdd: string
+    snippetsEdit: string
+    snippetsAddTitle: string
+    snippetsEditTitle: string
+    snippetsEditDesc: string
+    snippetsName: string
+    snippetsHint: string
+    snippetsTemplate: string
+    snippetsDeleteTitle: string
+    snippetsDeleteDesc: (label: string) => string
     snippets: Record<string, { label: string; description: string; text: string }>
     dropFiles: string
     dropSession: string

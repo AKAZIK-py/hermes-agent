@@ -1,12 +1,16 @@
 /** User-editable prompt snippets for the Desktop composer.
 
 Built-in list is a first-run seed — the original 3 composer snippets, using
-the active UI language. After that the list lives in localStorage; add / edit
-/ delete never touch i18n or source.
+the active UI language. After that the list lives in localStorage through the
+shared `persistentAtom` choke point (same as themes), so cross-window sync /
+telemetry hooks see the writes; add / edit / delete never touch i18n or source.
 
-Scope: desktop-global (`hermes-desktop-prompt-snippets-v1`), same class as
+Scope: desktop-global (`hermes.desktop.prompt-snippets`), same class as
 user-themes.
 */
+import { Codecs, persistentAtom } from '@/lib/persisted'
+import { readKey } from '@/lib/storage'
+
 export interface PromptSnippet {
   id: string
   description: string
@@ -16,7 +20,7 @@ export interface PromptSnippet {
 
 export type SnippetCopy = Pick<PromptSnippet, 'description' | 'label' | 'text'>
 
-export const PROMPT_SNIPPETS_STORAGE_KEY = 'hermes-desktop-prompt-snippets-v1'
+export const PROMPT_SNIPPETS_STORAGE_KEY = 'hermes.desktop.prompt-snippets'
 
 /** Same keys as the pre-CRUD `SNIPPET_KEYS` in context-menu.tsx. */
 export const BUILTIN_SNIPPET_KEYS = ['codeReview', 'implementationPlan', 'explainThis'] as const
@@ -61,6 +65,17 @@ function isSnippet(value: unknown): value is PromptSnippet {
   )
 }
 
+function sanitizeList(raw: unknown): PromptSnippet[] {
+  if (!Array.isArray(raw)) {
+    return []
+  }
+
+  return raw.filter(isSnippet)
+}
+
+/** Build the built-in seed using the active locale's snippet copy when
+ *  available, falling back to the English defaults. Called lazily so the
+ *  i18n runtime is initialised. */
 export function seedSnippets(copy?: Record<string, SnippetCopy>): PromptSnippet[] {
   return BUILTIN_SNIPPET_KEYS.map(id => {
     const localized = copy?.[id]
@@ -75,47 +90,48 @@ export function seedSnippets(copy?: Record<string, SnippetCopy>): PromptSnippet[
   })
 }
 
-/** Load the snippet list. Missing/corrupt storage falls back to the seed. */
-export function loadSnippets(copy?: Record<string, SnippetCopy>): PromptSnippet[] {
-  if (typeof window === 'undefined') {
-    return seedSnippets(copy)
-  }
+// The empty array is a valid, user-owned state. Track whether seeding is
+// needed from the persisted payload rather than from the current list length.
+// This read happens before persistentAtom's fallback subscription writes []
+// for a missing key.
+const persistedRaw = readKey(PROMPT_SNIPPETS_STORAGE_KEY)
+let shouldSeed = persistedRaw === null
 
+if (persistedRaw !== null) {
   try {
-    const raw = window.localStorage.getItem(PROMPT_SNIPPETS_STORAGE_KEY)
-
-    if (!raw) {
-      return seedSnippets(copy)
-    }
-
-    const parsed: unknown = JSON.parse(raw)
-
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      return seedSnippets(copy)
-    }
-
-    const items = (parsed as { items?: unknown }).items
-
-    if (!Array.isArray(items)) {
-      return seedSnippets(copy)
-    }
-
-    return items.filter(isSnippet)
+    shouldSeed = !Array.isArray(JSON.parse(persistedRaw) as unknown)
   } catch {
-    return seedSnippets(copy)
+    shouldSeed = true
   }
 }
 
-export function saveSnippets(items: PromptSnippet[]): void {
-  if (typeof window === 'undefined') {
+export const $promptSnippets = persistentAtom<PromptSnippet[]>(
+  PROMPT_SNIPPETS_STORAGE_KEY,
+  [],
+  Codecs.json(sanitizeList)
+)
+
+/** Seed the store with locale-appropriate built-in snippets the first time
+ *  the dialog opens (or after a corrupted-payload reset). A valid persisted
+ *  empty list is intentional and must remain empty. */
+function ensureSeeded(copy?: Record<string, SnippetCopy>): void {
+  if (!shouldSeed) {
     return
   }
 
-  try {
-    window.localStorage.setItem(PROMPT_SNIPPETS_STORAGE_KEY, JSON.stringify({ version: 1, items }))
-  } catch {
-    // Restricted storage shouldn't break the composer.
-  }
+  shouldSeed = false
+  $promptSnippets.set(seedSnippets(copy))
+}
+
+/** Load the snippet list. Missing/corrupt storage falls back to the seed. */
+export function loadSnippets(copy?: Record<string, SnippetCopy>): PromptSnippet[] {
+  ensureSeeded(copy)
+  return $promptSnippets.get().map(item => ({ ...item }))
+}
+
+export function saveSnippets(items: PromptSnippet[]): void {
+  shouldSeed = false
+  $promptSnippets.set(sanitizeList(items))
 }
 
 export function createSnippetId(): string {

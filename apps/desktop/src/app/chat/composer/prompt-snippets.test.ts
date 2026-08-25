@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   BUILTIN_SNIPPET_KEYS,
@@ -45,8 +45,14 @@ describe('prompt snippets store', () => {
     expect(loadSnippets()).toEqual([])
   })
 
-  it('falls back to the seed when storage is corrupt', () => {
+  it('falls back to the seed when storage is corrupt at startup', async () => {
     window.localStorage.setItem(PROMPT_SNIPPETS_STORAGE_KEY, '{not json')
-    expect(loadSnippets()).toHaveLength(3)
+
+    // persistentAtom reads storage once at module load; simulate a corrupt
+    // payload present at cold start by re-importing the module fresh.
+    vi.resetModules()
+    const fresh = await import('./prompt-snippets')
+
+    expect(fresh.loadSnippets()).toHaveLength(3)
   })
 })

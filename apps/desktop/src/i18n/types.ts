@@ -689,6 +689,23 @@ export interface Translations {
       cancel: string
       empty: string
     }
+    managedUpdates: {
+      title: string
+      intro: string
+      sshConnection: string
+      update: string
+      updating: string
+      progress: string
+      updated: string
+      partial: string
+      refused: string
+      failed: string
+      alreadyRunning: string
+      receipt: (id: string, outcome: string) => string
+      receiptVersions: (pre: string, post: string) => string
+      scopesRestored: (profiles: string) => string
+      scopeNotRestored: (profile: string, error: string) => string
+    }
     gateway: {
       loading: string
       unavailableTitle: string
@@ -2047,12 +2064,32 @@ export interface Translations {
     images: string
     pasteImage: string
     url: string
-    promptSnippets: string
+    promptTemplates: string
     tipPre: string
     tipPost: string
-    snippetsTitle: string
-    snippetsDesc: string
-    snippets: Record<string, { label: string; description: string; text: string }>
+    templatesTitle: string
+    templatesDesc: string
+    templates: Record<string, { label: string; description: string; text: string }>
+    templateAdd: string
+    templateAddFolder: string
+    templateEdit: string
+    templateDelete: string
+    templateReorder: string
+    templateMoveUp: string
+    templateMoveDown: string
+    templateIndent: string
+    templateOutdent: string
+    templateReset: string
+    templateFolderPlaceholder: string
+    templateConfirmDeleteFolder: string
+    templateResetConfirm: string
+    templateLabelPlaceholder: string
+    templateDescPlaceholder: string
+    templateTextPlaceholder: string
+    templateSave: string
+    templateCancel: string
+    templateEmpty: string
+    templateConfirmDelete: string
     dropFiles: string
     dropSession: string
     mcpSuggestions: {

@@ -588,10 +588,6 @@ export const en: Translations = {
       introSplashDesc: 'The wordmark and prompt shown on an empty chat.',
       reactionsTitle: 'Message Reactions',
       reactionsDesc: 'iMessage-style emoji tapbacks — react to messages, and Hermes can react to yours.',
-      tipsTitle: 'In-App Tips',
-      tipsDesc:
-        'While the app is idle, occasionally point out a part of it you may not have found yet. Closing a tip retires it for good.',
-      tipsReset: (count: number) => `Bring back ${count} closed ${count === 1 ? 'tip' : 'tips'}`,
       composerPopoutTitle: 'Floating Composer',
       composerPopoutDesc: 'Allow dragging the composer out of its dock. Turn this off to keep it locked at the bottom.',
       vibeHeartsTitle: 'Vibe Hearts',
@@ -2439,11 +2435,31 @@ export const en: Translations = {
     images: 'Images…',
     pasteImage: 'Paste image',
     url: 'URL…',
-    promptSnippets: 'Prompt snippets…',
+    promptTemplates: 'Prompt templates…',
     tipPre: 'Tip: type ',
     tipPost: ' to reference files inline.',
-    snippetsTitle: 'Prompt snippets',
-    snippetsDesc: 'Pick a starter prompt to drop into the composer.',
+    templatesTitle: 'Prompt templates',
+    templatesDesc: 'Pick a starter prompt to insert. Drag rows to reorder; drop onto a folder to group.',
+    templateAdd: 'Add template',
+    templateAddFolder: 'Add folder',
+    templateEdit: 'Edit',
+    templateDelete: 'Delete',
+    templateReorder: 'Drag to reorder',
+    templateMoveUp: 'Move up',
+    templateMoveDown: 'Move down',
+    templateIndent: 'Nest under folder above',
+    templateOutdent: 'Move out of folder',
+    templateReset: 'Reset to defaults',
+    templateFolderPlaceholder: 'Folder name',
+    templateConfirmDeleteFolder: 'Delete this folder and everything inside it?',
+    templateResetConfirm: 'Reset all templates to the three built-in defaults? Your custom templates will be lost.',
+    templateLabelPlaceholder: 'Label',
+    templateDescPlaceholder: 'Description (optional)',
+    templateTextPlaceholder: 'Prompt text',
+    templateSave: 'Save',
+    templateCancel: 'Cancel',
+    templateEmpty: 'No templates yet. Add one to get started.',
+    templateConfirmDelete: 'Delete this template?',
     dropFiles: 'Drop files to attach',
     dropSession: 'Drop to link this chat',
     mcpSuggestions: {
@@ -2483,21 +2499,21 @@ export const en: Translations = {
       done: 'Marked for scheduling',
       doneTip: 'Send it and the agent creates the job'
     },
-    snippets: {
+    templates: {
       codeReview: {
         label: 'Code review',
-        description: 'Audit the current change for regressions, dropped edge cases, and missing tests.',
-        text: 'Please review this for bugs, regressions, and missing tests.'
+        description: 'Check recent changes for regressions and untested edge cases.',
+        text: 'Review the code I shared. Flag any bugs, regressions, missing tests, or risky patterns — be specific about line numbers and suggest fixes.'
       },
       implementationPlan: {
         label: 'Implementation plan',
-        description: 'Outline an approach before touching code so the diff stays focused.',
-        text: 'Please make a concise implementation plan before changing code.'
+        description: 'Draft a step-by-step approach before writing any code.',
+        text: 'Before writing code, outline the implementation steps for this task. List the files you would change, the approach for each, and any risks or trade-offs.'
       },
       explainThis: {
         label: 'Explain this',
-        description: 'Walk through how the selected code works and link to the key files.',
-        text: 'Please explain how this works and point me to the key files.'
+        description: 'Get a walkthrough of how a piece of code works.',
+        text: 'Walk me through how this code works, step by step. Explain the key design decisions and point me to the files or functions that matter most.'
       }
     }
   },
@@ -3412,10 +3428,6 @@ export const en: Translations = {
     editFailed: 'Edit failed',
     editTurnUnavailable: 'This turn is no longer in server history (it may have been compressed away).',
     resumeFailed: 'Resume failed',
-    readOnlyTranscriptTitle: 'Opened read-only',
-    readOnlyTranscriptBody:
-      'No connected backend claims this older chat yet, so it opened as a read-only transcript. Its history is intact; sending is disabled until a backend claims it.',
-    readOnlyTranscriptSendBlocked: 'This chat is open as a read-only transcript — sending is disabled.',
     resumeStrandedTitle: "Couldn't load this session",
     resumeStrandedBody:
       'The connection to this session failed and automatic retries gave up. Check that the gateway is running, then try again.',
@@ -3460,52 +3472,6 @@ export const en: Translations = {
       systemNote: platform => `↻ Handed off to ${platform} — resume here anytime.`,
       failed: error => `Handoff failed: ${error}`,
       timedOut: 'Timed out waiting for the gateway. Is `hermes gateway` running?'
-    }
-  },
-
-  tips: {
-    close: "Don't show this tip again",
-    items: {
-      'new-session': {
-        title: 'Start fresh',
-        text: 'A new chat gets its own context, terminal and working directory.'
-      },
-      skills: {
-        title: 'Teach it once',
-        text: 'Skills are folders of instructions Hermes loads when the work calls for them.'
-      },
-      messaging: {
-        title: 'Hermes away from your desk',
-        text: 'Connect Telegram, Discord, Slack and more — same agent, same memory.'
-      },
-      artifacts: {
-        title: 'Everything Hermes made',
-        text: 'Images, files and links from every session, indexed in one place.'
-      },
-      cron: {
-        title: 'Work that runs itself',
-        text: 'Schedule a prompt hourly, nightly, or on a cron expression.'
-      },
-      'command-palette': {
-        title: 'One box for everything',
-        text: 'Sessions, settings, skills and commands all answer to the palette.'
-      },
-      profiles: {
-        title: 'Profiles are separate',
-        text: 'Each one is its own Hermes — own keys, own memory, own sessions.'
-      },
-      'composer-mentions': {
-        title: 'Attach and command',
-        text: 'Type @ to bring a file into the conversation, / to run a command.'
-      },
-      'model-switch': {
-        title: 'Switch models mid-thread',
-        text: 'The model name is a button. Change it whenever the work changes shape.'
-      },
-      'right-pane': {
-        title: 'The working pane',
-        text: 'Files, terminal, review and the in-app browser share the right side.'
-      }
     }
   },
 

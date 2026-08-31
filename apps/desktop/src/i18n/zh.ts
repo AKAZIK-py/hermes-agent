@@ -574,9 +574,6 @@ export const zh: Translations = {
       introSplashDesc: '空白对话中显示的字标和提示语。',
       reactionsTitle: '消息回应',
       reactionsDesc: 'iMessage 风格的表情回应 — 你可以给消息添加回应，Hermes 也能回应你的消息。',
-      tipsTitle: '应用内提示',
-      tipsDesc: '应用空闲时，偶尔指出你可能还没发现的功能。关掉一条就不再出现。',
-      tipsReset: (count: number) => `恢复 ${count} 条已关闭的提示`,
       composerPopoutTitle: '悬浮输入框',
       composerPopoutDesc: '允许将输入框拖出底部停靠区。关闭后，输入框会锁定在底部。',
       vibeHeartsTitle: '心情爱心',
@@ -1018,8 +1015,7 @@ export const zh: Translations = {
     },
     managedUpdates: {
       title: '托管更新',
-      intro:
-        '以事务方式更新由桌面端托管的 SSH 安装：先排空会话，再更新远端检出，最后恢复每个 profile，并生成关联回执。',
+      intro: '以事务方式更新由桌面端托管的 SSH 安装：先排空会话，再更新远端检出，最后恢复每个 profile，并生成关联回执。',
       sshConnection: '桌面端托管的 SSH 安装',
       update: '更新',
       updating: '更新中…',
@@ -2618,11 +2614,31 @@ export const zh: Translations = {
     images: '图片…',
     pasteImage: '粘贴图片',
     url: 'URL…',
-    promptSnippets: '提示词片段…',
+    promptTemplates: '提示词模板…',
     tipPre: '提示：输入 ',
     tipPost: ' 以内联引用文件。',
-    snippetsTitle: '提示词片段',
-    snippetsDesc: '选择一个起始提示词放入输入框。',
+    templatesTitle: '提示词模板',
+    templatesDesc: '选择起始提示词插入输入框。拖拽行可排序；拖到文件夹上可分组。',
+    templateAdd: '添加模板',
+    templateAddFolder: '添加文件夹',
+    templateEdit: '编辑',
+    templateDelete: '删除',
+    templateReorder: '拖拽排序',
+    templateMoveUp: '上移',
+    templateMoveDown: '下移',
+    templateIndent: '移入上一个文件夹',
+    templateOutdent: '移出文件夹',
+    templateReset: '恢复默认',
+    templateFolderPlaceholder: '文件夹名称',
+    templateConfirmDeleteFolder: '删除此文件夹及其内部全部内容？',
+    templateResetConfirm: '将所有模板恢复为三个内置默认值？自定义模板将丢失。',
+    templateLabelPlaceholder: '标签',
+    templateDescPlaceholder: '描述（可选）',
+    templateTextPlaceholder: '提示词文本',
+    templateSave: '保存',
+    templateCancel: '取消',
+    templateEmpty: '还没有模板。添加一个开始吧。',
+    templateConfirmDelete: '删除此模板？',
     dropFiles: '拖放文件以附加',
     dropSession: '拖放以链接此对话',
     mcpSuggestions: {
@@ -2662,21 +2678,21 @@ export const zh: Translations = {
       done: '已标记为定时任务',
       doneTip: '发送后由智能体创建任务'
     },
-    snippets: {
+    templates: {
       codeReview: {
         label: '代码审查',
-        description: '审查当前更改是否存在回归、遗漏的边界情况和缺失的测试。',
-        text: '请审查这部分是否存在缺陷、回归和缺失的测试。'
+        description: '检查近期改动是否有回归和未覆盖的边界情况。',
+        text: '审查我分享的代码，指出缺陷、回归、缺失的测试或有风险的模式。请给出具体行号和修复建议。'
       },
       implementationPlan: {
         label: '实现计划',
-        description: '在动代码之前先勾勒方案，让 diff 保持聚焦。',
-        text: '请在修改代码前制定一个简洁的实现计划。'
+        description: '写代码前先列出分步方案。',
+        text: '在写代码之前，先列出这个任务的实现步骤：要改哪些文件、每个文件的改法、以及潜在风险和取舍。'
       },
       explainThis: {
         label: '解释这段',
-        description: '讲解所选代码的工作方式，并链接到关键文件。',
-        text: '请解释这是如何工作的，并指给我关键文件。'
+        description: '逐步讲解某段代码的工作原理。',
+        text: '逐步讲解这段代码是如何工作的，解释关键设计决策，并指出最重要的文件和函数。'
       }
     }
   },
@@ -3556,10 +3572,6 @@ export const zh: Translations = {
     editFailed: '编辑失败',
     editTurnUnavailable: '此回合已不在服务器历史中（可能已被压缩移除）。',
     resumeFailed: '恢复失败',
-    readOnlyTranscriptTitle: '已以只读方式打开',
-    readOnlyTranscriptBody:
-      '尚无已连接的后端认领这个较早的会话，因此它以只读记录方式打开。历史记录完好；在有后端认领之前无法发送消息。',
-    readOnlyTranscriptSendBlocked: '该会话目前以只读记录方式打开——发送已禁用。',
     resumeStrandedTitle: '无法加载此会话',
     resumeStrandedBody: '与此会话的连接失败，自动重试已停止。请确认网关正在运行，然后重试。',
     resumeRetry: '重试',
@@ -3603,52 +3615,6 @@ export const zh: Translations = {
       systemNote: platform => `↻ 已移交到 ${platform} — 随时可在此处恢复。`,
       failed: error => `移交失败：${error}`,
       timedOut: '等待网关超时。`hermes gateway` 是否正在运行？'
-    }
-  },
-
-  tips: {
-    close: '不再显示这条提示',
-    items: {
-      'new-session': {
-        title: '从头开始',
-        text: '新对话拥有独立的上下文、终端和工作目录。'
-      },
-      skills: {
-        title: '教一次就够',
-        text: '技能是一组说明文件，Hermes 会在需要时自行加载。'
-      },
-      messaging: {
-        title: '离开电脑也能用',
-        text: '接入 Telegram、Discord、Slack 等 — 同一个智能体，同一份记忆。'
-      },
-      artifacts: {
-        title: 'Hermes 做过的一切',
-        text: '所有会话里的图片、文件和链接，都汇总在这里。'
-      },
-      cron: {
-        title: '会自己运行的任务',
-        text: '让一条提示按小时、按夜间，或按 cron 表达式定时执行。'
-      },
-      'command-palette': {
-        title: '一个输入框搞定一切',
-        text: '会话、设置、技能和命令都能从命令面板找到。'
-      },
-      profiles: {
-        title: '配置文件彼此独立',
-        text: '每个都是独立的 Hermes — 自己的密钥、记忆和会话。'
-      },
-      'composer-mentions': {
-        title: '附件与命令',
-        text: '输入 @ 把文件带入对话，输入 / 运行命令。'
-      },
-      'model-switch': {
-        title: '对话中随时换模型',
-        text: '模型名称就是按钮。工作性质变了就换一个。'
-      },
-      'right-pane': {
-        title: '工作面板',
-        text: '文件、终端、审阅和内置浏览器都在侧边面板里。'
-      }
     }
   },
 

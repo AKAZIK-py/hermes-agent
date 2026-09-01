@@ -23,6 +23,7 @@ from fastapi import APIRouter, HTTPException, Query, Request  # noqa: F401
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse
 
+from hermes_cli.sqlite_safe_read import is_transient_sqlite_error
 from hermes_cli.web_deps import late
 from hermes_cli.web_models import (
     BulkDeleteSessions,
@@ -197,6 +198,21 @@ def get_sessions(
             db.close()
     except HTTPException:
         raise
+    except sqlite3.OperationalError as exc:
+        _log.exception("GET /api/sessions failed")
+        # 503, not 500: the store is busy, not gone. Desktop must keep the
+        # previous sidebar instead of treating this as an authoritative empty
+        # list. Do not retry the open/close here — another close() in this
+        # process would cancel POSIX locks on the live writer.
+        transient = is_transient_sqlite_error(exc)
+        raise HTTPException(
+            status_code=503 if transient else 500,
+            detail=(
+                "Session store is busy (disk I/O or lock). Retry; the list was not cleared."
+                if transient
+                else "Internal server error"
+            ),
+        ) from exc
     except Exception:
         _log.exception("GET /api/sessions failed")
         raise HTTPException(status_code=500, detail="Internal server error")

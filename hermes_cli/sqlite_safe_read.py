@@ -73,6 +73,23 @@ logger = logging.getLogger(__name__)
 
 SQLITE_HEADER_MAGIC = b"SQLite format 3\x00"
 
+# Concurrent writers can surface these as OperationalError on a read that
+# does not need to fail the whole request. Shared so list/sidebar
+# classification cannot drift.
+TRANSIENT_SQLITE_MARKERS = (
+    "disk i/o",
+    "database is locked",
+    "database table is locked",
+    "busy",
+)
+
+
+def is_transient_sqlite_error(exc: BaseException) -> bool:
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    msg = str(exc).lower()
+    return any(marker in msg for marker in TRANSIENT_SQLITE_MARKERS)
+
 # Offset of the 4-byte big-endian page-count field in the SQLite header.
 _HEADER_PAGE_COUNT_OFFSET = 28
 

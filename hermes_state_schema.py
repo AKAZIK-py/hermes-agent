@@ -407,9 +407,32 @@ class SessionSchemaMixin:
                     return None
                 if "no such table" in str(exc).lower():
                     return False
+                msg = str(exc).lower()
+                # Concurrent writers (Desktop serve + gateway on a large WAL)
+                # can IOERR / lock this capability probe. Listing sessions
+                # does not need FTS. Re-raising 500s GET /api/sessions and
+                # the constructor then close()s this fd, which cancels POSIX
+                # locks for every other connection in the process — the
+                # documented route to a 0-byte WAL.
+                if any(
+                    marker in msg
+                    for marker in (
+                        "disk i/o",
+                        "database is locked",
+                        "database table is locked",
+                        "busy",
+                    )
+                ):
+                    logger.warning(
+                        "%s probe hit transient sqlite error; FTS disabled "
+                        "for this open: %s",
+                        table_name,
+                        exc,
+                    )
+                    return None
                 # Re-raise any other OperationalError (e.g. malformed schema,
                 # corrupt vtable that isn't a decode error).
-                if "decode to utf-8" not in str(exc).lower():
+                if "decode to utf-8" not in msg:
                     raise
             # Swallow: decode error means the index is degraded but the
             # store remains accessible. Writable init / recovery will
@@ -522,7 +545,10 @@ class SessionSchemaMixin:
             # A corrupt vtable may fail even a LIMIT 0 probe. It still needs
             # to be included in the drop-and-recreate recovery below.
             trigram_status = True
-        include_trigram = trigram_status is True
+        # False = no such table (skip trigram DDL). True = queryable.
+        # None = probe degraded (IOERR/lock) — the table likely exists and
+        # must still be dropped, or CREATE later collides.
+        include_trigram = trigram_status is not False
 
         drop_sql = "".join(
             f"DROP TRIGGER IF EXISTS {trigger};" for trigger in _FTS_TRIGGERS

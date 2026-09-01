@@ -28,6 +28,9 @@ import { queryClient } from './lib/query-client'
 import { installRendererAnimationPauseState } from './lib/renderer-loop-pause'
 import { installSelectionCopyColorGuard } from './lib/selection-copy-colors'
 import { ThemeProvider } from './themes/context'
+import { startPromptImportInbox } from './store/prompt-import-inbox'
+
+startPromptImportInbox()
 
 installClipboardShim()
 // Chromium serializes selection copies (Cmd+C, right-click Copy) with the

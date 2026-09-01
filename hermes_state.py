@@ -5496,8 +5496,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if self._db_replaced or self._db_file_was_replaced():
             self._halt_db_replaced()
         logger.warning(
-            "state.db connection for %s was closed while a %s was still in "
-            "flight — reopening (teardown/worker race, #94736)",
+            "state.db connection for %s reopening after %s",
             self.db_path,
             context,
         )
@@ -5820,6 +5819,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # Set on the first compression-busy collision so the short wait is
         # measured from then, not from the start of the write.
         compression_deadline: Optional[float] = None
+        # One retry for IOERR on BEGIN IMMEDIATE only — the callback has
+        # not run, so there is no durable effect to replay. Never close()
+        # the writer to "heal" IOERR: POSIX close() of any fd for this
+        # file drops every lock this process holds (#99502, howtocorrupt).
+        ioerr_begin_retried = False
 
         # Transient engine-level error observed on contended WAL appends
         # (dual gateway/agent writers; FTS5 trigram sync holds the write
@@ -5833,6 +5837,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         while True:
             self._raise_if_db_replaced()
+            fn_started = False
             try:
                 with self._lock:
                     if self._conn is None:
@@ -5841,6 +5846,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         self._reopen_after_close_locked(context="write")
                     self._conn.execute("BEGIN IMMEDIATE")
                     try:
+                        fn_started = True
                         result = fn(self._conn)
                         self._conn.commit()
                     except BaseException:
@@ -5893,7 +5899,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     ) from exc
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
-                # Non-lock error or patience exhausted — propagate.
+                if (
+                    "disk i/o" in err_msg
+                    and not fn_started
+                    and not ioerr_begin_retried
+                    and self._sleep_before_write_retry(deadline, patience_s)
+                ):
+                    ioerr_begin_retried = True
+                    continue
+                # Non-lock error, callback already ran, or patience exhausted.
+                # Do not close()+replay: settlement is unknown and close()
+                # drops POSIX locks for sibling connections in this process.
                 raise
             except sqlite3.DatabaseError as exc:
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):

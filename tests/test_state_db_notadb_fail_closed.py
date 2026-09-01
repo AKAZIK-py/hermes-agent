@@ -1,11 +1,12 @@
 """Tests for fail-closed state.db NOTADB handling and journal-mode EIO retries.
 
-Covers the two independently-valuable pieces salvaged from the state.db
-hardening rollup:
+Covers:
 
-* fail closed when a live write connection reports ``file is not a database``;
-* transient ``disk i/o error`` retry in ``_on_disk_journal_mode`` so a
-  one-shot EIO doesn't push callers onto the fail-closed unknown-mode branch.
+* IOERR on BEGIN IMMEDIATE (callback has not run) may retry once on the
+  same connection — no close(), no replay of a started write (#99502);
+* IOERR after the callback mutates must NOT rerun the callback;
+* genuine on-disk NOTADB / replaced file still fail-closed (#89332);
+* transient ``disk i/o error`` retry in ``_on_disk_journal_mode``.
 """
 
 import sqlite3
@@ -16,36 +17,101 @@ import pytest
 from hermes_state import SessionDB, _on_disk_journal_mode
 
 
-class _NotADbOnce:
-    """Connection proxy that raises 'file is not a database' on execute."""
+class _BeginIoerrOnce:
+    """Fail the first BEGIN IMMEDIATE, then proxy to the real connection."""
 
     def __init__(self, real_conn):
         self._real = real_conn
+        self.begins = 0
 
-    def execute(self, *args, **kwargs):
-        raise sqlite3.DatabaseError("file is not a database")
+    def execute(self, sql, *args, **kwargs):
+        if str(sql).strip().upper().startswith("BEGIN") and self.begins == 0:
+            self.begins += 1
+            raise sqlite3.OperationalError("disk I/O error")
+        return self._real.execute(sql, *args, **kwargs)
 
     def __getattr__(self, name):
         return getattr(self._real, name)
 
 
-class TestFailClosedAfterNotADb:
-    def test_write_does_not_reopen_after_connection_identity_breaks(
-        self, tmp_path, monkeypatch
-    ):
-        """One connection cannot safely heal a shared DB identity change."""
+class TestWriteIoerrSettlement:
+    def test_begin_ioerr_retries_once_without_reopen(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(SessionDB, "_WRITE_PATIENCE_S", 2.0)
+        monkeypatch.setattr(SessionDB, "_WRITE_RETRY_MIN_S", 0.001)
+        monkeypatch.setattr(SessionDB, "_WRITE_RETRY_MAX_S", 0.005)
         db = SessionDB(db_path=tmp_path / "state.db")
-        real_conn = db._conn
+        original = db._conn
+        connects = {"n": 0}
+        import hermes_state as hs
+
+        real_connect = hs._connect_tracked_db
+
+        def counting_connect(*args, **kwargs):
+            connects["n"] += 1
+            return real_connect(*args, **kwargs)
+
+        monkeypatch.setattr("hermes_state._connect_tracked_db", counting_connect)
+        try:
+            db._conn = _BeginIoerrOnce(original)  # type: ignore[assignment]
+            calls = {"n": 0}
+
+            def write(conn):
+                calls["n"] += 1
+                conn.execute(
+                    "INSERT INTO state_meta (key, value) VALUES ('eio', 'ok') "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+                )
+                return "done"
+
+            assert db._execute_write(write) == "done"
+            assert calls["n"] == 1
+            assert connects["n"] == 0
+            assert db.get_meta("eio") == "ok"
+        finally:
+            db._conn = original
+            db.close()
+
+    def test_ioerr_after_mutation_does_not_replay(self, tmp_path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            calls = {"n": 0}
+
+            def boom(conn):
+                calls["n"] += 1
+                conn.execute(
+                    "INSERT INTO state_meta (key, value) VALUES ('once', '1') "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+                )
+                raise sqlite3.OperationalError("disk I/O error")
+
+            with pytest.raises(sqlite3.OperationalError, match="disk I/O"):
+                db._execute_write(boom)
+            assert calls["n"] == 1
+            assert db.get_meta("once") is None
+        finally:
+            db.close()
+
+    def test_notadb_does_not_reopen(self, tmp_path, monkeypatch):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        real = db._conn
         try:
             db.create_session(session_id="s1", source="cli", model="test")
+
+            class Boom:
+                def execute(self, *args, **kwargs):
+                    raise sqlite3.DatabaseError("file is not a database")
+
+                def __getattr__(self, name):
+                    return getattr(real, name)
+
+            db._conn = Boom()  # type: ignore[assignment]
             reopen = MagicMock()
             monkeypatch.setattr("hermes_state._connect_tracked_db", reopen)
-            db._conn = _NotADbOnce(real_conn)
             with pytest.raises(sqlite3.DatabaseError, match="not a database"):
-                db.create_session(session_id="s2", source="cli", model="test")
+                db._execute_write(lambda conn: conn.execute("SELECT 1"))
             reopen.assert_not_called()
         finally:
-            db._conn = real_conn
+            db._conn = real
             db.close()
 
 

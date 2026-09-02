@@ -19,16 +19,18 @@ import inspect
 import json
 import logging
 import re
+import sqlite3
 import subprocess  # noqa: F401
 import sys  # noqa: F401
 import threading
-import time  # noqa: F401
+import time
 from collections import OrderedDict
 from pathlib import Path  # noqa: F401
 from typing import Any, Dict, List, Optional, Tuple  # noqa: F401
 
 from fastapi import APIRouter, HTTPException, Query  # noqa: F401
 
+from hermes_cli.sqlite_safe_read import is_transient_sqlite_error
 from hermes_cli.web_deps import late
 from hermes_cli.web_models import (
     ProfileCreate,
@@ -138,9 +140,56 @@ def _sidebar_profile_cache_put(key, value):
             _SIDEBAR_PROFILE_CACHE.popitem(last=False)
 
 
+# Last successful per-path sidebar slices. Independent of WAL fingerprint:
+# a 0-byte WAL changes the fingerprint, misses the TTL cache, and a failed
+# rescan would otherwise return recents=[] which the packaged Desktop
+# treats as an authoritative empty list.
+_LAST_GOOD_SIDEBAR_SLICES: dict = {}
+
+
 def _sidebar_profile_cache_clear():
     with _SIDEBAR_PROFILE_CACHE_LOCK:
         _SIDEBAR_PROFILE_CACHE.clear()
+        _LAST_GOOD_SIDEBAR_SLICES.clear()
+
+
+def _remember_sidebar_slices(db_path, slices) -> None:
+    _LAST_GOOD_SIDEBAR_SLICES[str(db_path)] = copy.deepcopy(slices)
+
+
+def _recall_sidebar_slices(db_path):
+    value = _LAST_GOOD_SIDEBAR_SLICES.get(str(db_path))
+    return copy.deepcopy(value) if value is not None else None
+
+
+# Concurrent writers (the live Desktop session flushing turns) can make a
+# read-only sidebar scan fail with SQLITE_IOERR / BUSY. Retry those queries
+# on an already-open connection; do not retry by open/close — POSIX close()
+# of any fd for this file cancels every lock this process holds.
+# Do not retry corruption — that would only delay the errors[] payload.
+_SQLITE_READ_RETRY_ATTEMPTS = 3
+_SQLITE_READ_RETRY_DELAY_S = 0.05
+
+
+def _transient_sqlite_error(exc: BaseException) -> bool:
+    return is_transient_sqlite_error(exc)
+
+
+def _retry_sqlite_read(fn, *, attempts: int = _SQLITE_READ_RETRY_ATTEMPTS, delay: float = _SQLITE_READ_RETRY_DELAY_S):
+    """Retry *fn* on transient OperationalError.
+
+    *fn* must be queries against a connection that is already open.
+    Wrapping connect/close here would cancel POSIX locks on sibling
+    writers in this process.
+    """
+    for index in range(attempts):
+        try:
+            return fn()
+        except Exception as exc:
+            if not _transient_sqlite_error(exc) or index == attempts - 1:
+                raise
+            time.sleep(delay * (index + 1))
+    raise RuntimeError("sqlite read retry exhausted")
 
 
 def _sidebar_singleflight_cache(func):
@@ -197,6 +246,11 @@ def _sidebar_singleflight_cache(func):
             if cached is not miss:
                 return cached
             result = func(*args, **kwargs)
+            # A 200 with errors[] is a failed profile scan, not a successful
+            # empty page. Caching it for the TTL keeps Yesterday/This-week
+            # dropped after the DB recovers.
+            if isinstance(result, dict) and result.get("errors"):
+                return result
             try:
                 snapshot = copy.deepcopy(result)
             except Exception:
@@ -292,7 +346,7 @@ def get_profiles_sessions(
         db_path = Path(home) / "state.db"
         if not db_path.exists():
             continue
-        try:
+        def _load_profile_page():
             # Read-only on the healthy path: this loop runs on every sidebar
             # refresh, so it must not routinely DDL/write-lock another
             # profile's live DB (see SessionDB read_only docstring). The
@@ -302,51 +356,55 @@ def get_profiles_sessions(
             # opens skip column reconciliation and would otherwise fail here
             # on every refresh until something else opened the DB writable.
             db = _open_session_db_at_path(db_path, read_only=True)
+            try:
+                def _read():
+                    rows = db.list_sessions_rich(
+                        source=source_filter,
+                        sources=source_list or None,
+                        exclude_sources=exclude_list or None,
+                        limit=per_profile,
+                        offset=0,
+                        min_message_count=min_message_count,
+                        include_archived=include_archived,
+                        archived_only=archived_only,
+                        order_by_last_active=order == "recent",
+                        # Same SQL-level blob skip as /api/sessions (see above).
+                        compact_rows=not full,
+                        include_pinned=True,
+                    )
+                    profile_total = db.session_count(
+                        source=source_filter,
+                        sources=source_list or None,
+                        exclude_sources=exclude_list or None,
+                        min_message_count=min_message_count,
+                        include_archived=include_archived,
+                        archived_only=archived_only,
+                        exclude_children=True,
+                    )
+                    return rows, profile_total
+
+                return _retry_sqlite_read(_read)
+            finally:
+                db.close()
+
+        try:
+            rows, profile_total = _load_profile_page()
         except Exception as exc:
             _warn_profile_read_error(name, exc)
             errors.append({"profile": name, "error": str(exc)})
             continue
-        try:
-            rows = db.list_sessions_rich(
-                source=source_filter,
-                sources=source_list or None,
-                exclude_sources=exclude_list or None,
-                limit=per_profile,
-                offset=0,
-                min_message_count=min_message_count,
-                include_archived=include_archived,
-                archived_only=archived_only,
-                order_by_last_active=order == "recent",
-                # Same SQL-level blob skip as /api/sessions (see above).
-                compact_rows=not full,
-                include_pinned=True,
+        total += profile_total
+        profile_totals[name] = profile_total
+        for s in rows:
+            s["profile"] = name
+            s["is_default_profile"] = name == "default"
+            s["is_active"] = (
+                s.get("ended_at") is None
+                and (now - s.get("last_active", s.get("started_at", 0))) < 300
             )
-            profile_total = db.session_count(
-                source=source_filter,
-                sources=source_list or None,
-                exclude_sources=exclude_list or None,
-                min_message_count=min_message_count,
-                include_archived=include_archived,
-                archived_only=archived_only,
-                exclude_children=True,
-            )
-            total += profile_total
-            profile_totals[name] = profile_total
-            for s in rows:
-                s["profile"] = name
-                s["is_default_profile"] = name == "default"
-                s["is_active"] = (
-                    s.get("ended_at") is None
-                    and (now - s.get("last_active", s.get("started_at", 0))) < 300
-                )
-                s["archived"] = bool(s.get("archived"))
-                s["pinned"] = bool(s.get("pinned"))
-                merged.append(s)
-        except Exception as exc:
-            _warn_profile_read_error(name, exc)
-            errors.append({"profile": name, "error": str(exc)})
-        finally:
-            db.close()
+            s["archived"] = bool(s.get("archived"))
+            s["pinned"] = bool(s.get("pinned"))
+            merged.append(s)
 
     sort_key = "last_active" if order == "recent" else "started_at"
     merged.sort(key=lambda s: s.get(sort_key) or s.get("started_at") or 0, reverse=True)
@@ -476,36 +534,46 @@ def get_profiles_sessions_sidebar(
         )
         slices = _sidebar_profile_cache_get(profile_cache_key)
         if slices is None:
-            try:
+            def _load_sidebar_slices():
                 # Read-only with the stale-schema heal — same contract as the
                 # per-slice endpoint above (one-time writable reconcile when the
                 # store predates a schema addition, plain read-only otherwise).
                 db = _open_session_db_at_path(db_path, read_only=True)
-            except Exception as exc:
-                _warn_profile_read_error(name, exc)
-                errors.append({"profile": name, "error": str(exc)})
-                continue
+                try:
+                    def _read():
+                        return {
+                            "recents": _slice(db, exclude=recents_exclude_list, cap=recents_cap),
+                            # Aggregated in SQL rather than over the recents window: the
+                            # window is a page, and a total that shrank when you scrolled
+                            # would be worse than no total at all.
+                            "usage": db.usage_totals(),
+                            "cron": _slice(db, source="cron", cap=cron_cap),
+                            "messaging": _slice(
+                                db,
+                                exclude=messaging_exclude_list,
+                                cap=messaging_cap,
+                            ),
+                        }
+
+                    return _retry_sqlite_read(_read)
+                finally:
+                    db.close()
+
             try:
-                slices = {
-                    "recents": _slice(db, exclude=recents_exclude_list, cap=recents_cap),
-                    # Aggregated in SQL rather than over the recents window: the
-                    # window is a page, and a total that shrank when you scrolled
-                    # would be worse than no total at all.
-                    "usage": db.usage_totals(),
-                    "cron": _slice(db, source="cron", cap=cron_cap),
-                    "messaging": _slice(
-                        db,
-                        exclude=messaging_exclude_list,
-                        cap=messaging_cap,
-                    ),
-                }
+                slices = _load_sidebar_slices()
+                _remember_sidebar_slices(db_path, slices)
                 _sidebar_profile_cache_put(profile_cache_key, slices)
             except Exception as exc:
-                _warn_profile_read_error(name, exc)
-                errors.append({"profile": name, "error": str(exc)})
-                continue
-            finally:
-                db.close()
+                slices = _recall_sidebar_slices(db_path)
+                if slices is None:
+                    _warn_profile_read_error(name, exc)
+                    errors.append({"profile": name, "error": str(exc)})
+                    continue
+                _log.warning(
+                    "sidebar scan failed for %s (%s); serving last good list",
+                    name,
+                    exc,
+                )
 
         profile_rows = slices["recents"]
         # A full window means more rows remain on disk. That is all the
@@ -1173,12 +1241,14 @@ async def export_profile_endpoint(name: str, body: ProfileExport):
 
     output = (body.output or "").strip()
     if not output:
+        from hermes_constants import get_hermes_home
+        staging = get_hermes_home() / "profile-exports"
         try:
-            output = str(profiles_mod.get_profile_export_path(name))
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
+            staging.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             raise HTTPException(status_code=500, detail=f"Could not create export directory: {exc}")
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        output = str(staging / f"{profiles_mod.normalize_profile_name(name)}-{stamp}.tar.gz")
 
     loop = asyncio.get_running_loop()
     try:

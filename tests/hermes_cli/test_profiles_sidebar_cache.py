@@ -1,6 +1,7 @@
 """Regression tests for dashboard sidebar scan coalescing."""
 
 import inspect
+import sqlite3
 import tempfile
 import threading
 import time
@@ -127,6 +128,89 @@ class SidebarCacheTests(unittest.TestCase):
         self.assertEqual(scan(), {"ok": True})
         self.assertEqual(scan(), {"ok": True})
         self.assertEqual(calls, 2)
+
+    def test_does_not_cache_payloads_that_carry_profile_errors(self):
+        # A 200 with errors=[]-nonempty is how a failed profile scan is
+        # reported. Caching it for the 5s TTL keeps the empty recents page
+        # in front of a recovered DB and the sidebar stays blank.
+        calls = 0
+
+        @profiles._sidebar_singleflight_cache
+        def scan():
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return {"errors": [{"profile": "default", "error": "disk I/O error"}], "recents": {"sessions": []}}
+            return {"errors": [], "recents": {"sessions": [{"id": "yesterday"}]}}
+
+        first = scan()
+        second = scan()
+
+        self.assertEqual(first["errors"][0]["error"], "disk I/O error")
+        self.assertEqual(second["recents"]["sessions"], [{"id": "yesterday"}])
+        self.assertEqual(calls, 2)
+
+    def test_transient_sqlite_error_retries_ioerr_not_malformed(self):
+        self.assertTrue(
+            profiles._transient_sqlite_error(sqlite3.OperationalError("disk I/O error"))
+        )
+        self.assertTrue(
+            profiles._transient_sqlite_error(sqlite3.OperationalError("database is locked"))
+        )
+        self.assertFalse(
+            profiles._transient_sqlite_error(sqlite3.DatabaseError("database disk image is malformed"))
+        )
+        self.assertFalse(profiles._transient_sqlite_error(RuntimeError("disk I/O error")))
+
+    def test_retry_sqlite_read_recovers_after_disk_io_errors(self):
+        calls = 0
+
+        def flaky():
+            nonlocal calls
+            calls += 1
+            if calls < 3:
+                raise sqlite3.OperationalError("disk I/O error")
+            return {"ok": True}
+
+        with mock.patch.object(profiles.time, "sleep"):
+            self.assertEqual(profiles._retry_sqlite_read(flaky), {"ok": True})
+        self.assertEqual(calls, 3)
+
+    def test_failed_scan_serves_last_good_slices(self):
+        db_path = "/tmp/state.db"
+        good = {
+            "recents": [{"id": "yesterday", "pinned": False}],
+            "usage": {"tokens": 1},
+            "cron": [],
+            "messaging": [],
+        }
+        profiles._remember_sidebar_slices(db_path, good)
+        recalled = profiles._recall_sidebar_slices(db_path)
+        self.assertEqual(recalled["recents"][0]["id"], "yesterday")
+        recalled["recents"][0]["id"] = "mutated"
+        self.assertEqual(
+            profiles._recall_sidebar_slices(db_path)["recents"][0]["id"],
+            "yesterday",
+        )
+        profiles._sidebar_profile_cache_clear()
+        self.assertIsNone(profiles._recall_sidebar_slices(db_path))
+
+    def test_retry_sqlite_read_does_not_retry_malformed(self):
+        calls = 0
+
+        def corrupt():
+            nonlocal calls
+            calls += 1
+            raise sqlite3.DatabaseError("database disk image is malformed")
+
+        with self.assertRaises(sqlite3.DatabaseError):
+            profiles._retry_sqlite_read(corrupt)
+        self.assertEqual(calls, 1)
+
+    def test_retry_sqlite_read_doc_forbids_wrapping_connect_close(self):
+        source = inspect.getsource(profiles._retry_sqlite_read)
+        self.assertIn("already open", source)
+        self.assertNotIn("SessionDB", source)
 
     def test_can_be_disabled(self):
         calls = 0

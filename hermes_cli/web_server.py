@@ -12493,6 +12493,28 @@ _session_db_heal_exhausted: set = set()
 _session_db_heal_warned: set = set()
 
 
+_ro_session_db_cache: dict = {}
+_ro_session_db_cache_lock = threading.Lock()
+# Lost the retain race: extra readers we must not close() (POSIX).
+_ro_session_db_orphans: list = []
+
+
+def _ro_session_db_cache_clear():
+    """Test helper. Does not close cached connections (POSIX)."""
+    with _ro_session_db_cache_lock:
+        _ro_session_db_cache.clear()
+        _ro_session_db_orphans.clear()
+
+
+def _retain_readonly_session_db(db):
+    """Keep *db* for the process; make close() a no-op without wrapping.
+
+    A wrapper would break ``isinstance`` checks (heal tests swap in fakes).
+    """
+    db.close = lambda: None
+    return db
+
+
 def _open_session_db_at_path(db_path: Path, *, read_only: bool):
     """Open a SessionDB at an explicit path with an explicit access mode.
 
@@ -12507,13 +12529,34 @@ def _open_session_db_at_path(db_path: Path, *, read_only: bool):
     reconcile the store's own backend runs at startup. Tables created
     outside SCHEMA_SQL (telemetry ``tel_*``, FTS shadow tables) are
     deliberately outside both the probe and the heal.
+
+    Read-only opens are retained for the process lifetime: callers may
+    close() them, but that is ignored so a list poll cannot drop POSIX
+    locks on the live writer.
     """
     import sqlite3
 
+    from hermes_cli.sqlite_safe_read import is_transient_sqlite_error
     from hermes_state import SessionDB, is_malformed_schema_error
 
     if not read_only:
         return SessionDB(db_path=db_path, read_only=False)
+
+    cache_key = str(db_path)
+    with _ro_session_db_cache_lock:
+        cached = _ro_session_db_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+    def _retain(db):
+        with _ro_session_db_cache_lock:
+            existing = _ro_session_db_cache.get(cache_key)
+            if existing is not None:
+                _retain_readonly_session_db(db)
+                _ro_session_db_orphans.append(db)
+                return existing
+            _ro_session_db_cache[cache_key] = _retain_readonly_session_db(db)
+            return _ro_session_db_cache[cache_key]
 
     def _needs_bootstrap() -> bool:
         try:
@@ -12537,13 +12580,21 @@ def _open_session_db_at_path(db_path: Path, *, read_only: bool):
             try:
                 for statement in _session_db_read_probe_statements():
                     conn.execute(statement).fetchone()
-            except BaseException:
+            except BaseException as exc:
+                if is_transient_sqlite_error(exc):
+                    _log.warning(
+                        "schema probe hit transient sqlite error on %s; "
+                        "serving the reader without a full probe: %s",
+                        db_path,
+                        exc,
+                    )
+                    return db
                 db.close()
                 raise
         return db
 
     try:
-        return _open_probed()
+        opened = _open_probed()
     except (sqlite3.DatabaseError, UnicodeDecodeError) as exc:
         message = str(exc).lower()
         stale_schema = "no such table" in message or "no such column" in message
@@ -12557,7 +12608,7 @@ def _open_session_db_at_path(db_path: Path, *, read_only: bool):
             raise
         SessionDB(db_path=db_path, read_only=False).close()
         try:
-            return _open_probed()
+            return _retain(_open_probed())
         except (sqlite3.DatabaseError, UnicodeDecodeError) as still_stale:
             message = str(still_stale).lower()
             if "no such table" not in message and "no such column" not in message:
@@ -12577,7 +12628,9 @@ def _open_session_db_at_path(db_path: Path, *, read_only: bool):
                     db_path,
                     still_stale,
                 )
-            return _open_probed()
+            return _retain(_open_probed())
+
+    return _retain(opened)
 
 
 def _open_session_db_for_profile(profile: Optional[str], *, read_only: bool):

@@ -5,6 +5,7 @@ import time
 from urllib.parse import urlencode
 
 import pytest
+import hermes_cli.web_server_chat as _web_server_chat
 
 
 class _OneFrameBridge:
@@ -37,21 +38,8 @@ def pty_client(monkeypatch, _isolate_hermes_home):
     from starlette.testclient import TestClient
 
     import hermes_cli.web_server as ws
-    from hermes_cli.pty_session import PtySessionRegistry
-
     monkeypatch.setattr(ws, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
-    monkeypatch.setattr(ws, "_PTY_BRIDGE_AVAILABLE", True)
-    monkeypatch.setattr(ws, "PtyBridge", _OneFrameBridge)
-    monkeypatch.setattr(
-        ws,
-        "PTY_REGISTRY",
-        PtySessionRegistry(
-            ttl=1800,
-            max_sessions=16,
-            buffer_cap=1024,
-            read_timeout=0.01,
-        ),
-    )
+    monkeypatch.setattr(_web_server_chat.PtyBridge, "spawn", _OneFrameBridge.spawn)
     ws.app.state.pty_active_session_files = {}
 
     client = TestClient(ws.app)
@@ -70,7 +58,7 @@ def test_fresh_param_ignores_channel_active_session_file(pty_client, monkeypatch
     """Explicit fresh starts must not resurrect the prior channel session."""
     ws, client, token = pty_client
     channel = "fresh-chan"
-    active_file = ws._active_session_file_for_channel(ws.app, channel)
+    active_file = _web_server_chat._active_session_file_for_channel(ws.app, channel)
     active_file.write_text(json.dumps({"session_id": "sess-old"}), encoding="utf-8")
     captured = {}
 
@@ -79,7 +67,7 @@ def test_fresh_param_ignores_channel_active_session_file(pty_client, monkeypatch
         captured["resume"] = resume
         return (["fake-hermes-tui"], None, None)
 
-    monkeypatch.setattr(ws, "_resolve_chat_argv", fake_resolve)
+    monkeypatch.setattr(_web_server_chat, "_resolve_chat_argv", fake_resolve)
 
     with client.websocket_connect(_url(token, channel=channel, fresh="1")) as conn:
         assert conn.receive_bytes() == b"ready"
@@ -100,11 +88,11 @@ def test_active_session_fallback_sends_resume_control_message(pty_client, monkey
     """
     ws, client, token = pty_client
     channel = "implicit-resume-chan"
-    active_file = ws._active_session_file_for_channel(ws.app, channel)
+    active_file = _web_server_chat._active_session_file_for_channel(ws.app, channel)
     active_file.write_text(json.dumps({"session_id": "sess-old"}), encoding="utf-8")
 
     monkeypatch.setattr(
-        ws, "_resolve_chat_argv", lambda **kw: (["fake-hermes-tui"], None, None)
+        _web_server_chat, "_resolve_chat_argv", lambda **kw: (["fake-hermes-tui"], None, None)
     )
 
     with client.websocket_connect(_url(token, channel=channel)) as conn:
@@ -118,7 +106,7 @@ def test_explicit_resume_sends_no_control_message(pty_client, monkeypatch):
     channel = "explicit-resume-chan"
 
     monkeypatch.setattr(
-        ws, "_resolve_chat_argv", lambda **kw: (["fake-hermes-tui"], None, None)
+        _web_server_chat, "_resolve_chat_argv", lambda **kw: (["fake-hermes-tui"], None, None)
     )
 
     with client.websocket_connect(
@@ -147,9 +135,9 @@ def test_child_eof_closes_socket_and_bridge(pty_client, monkeypatch):
             bridges.append(b)
             return b
 
-    monkeypatch.setattr(ws.PtyBridge, "spawn", _RecordingBridge.spawn)
+    monkeypatch.setattr(_web_server_chat.PtyBridge, "spawn", _RecordingBridge.spawn)
     monkeypatch.setattr(
-        ws, "_resolve_chat_argv", lambda **kw: (["fake-hermes-tui"], None, None)
+        _web_server_chat, "_resolve_chat_argv", lambda **kw: (["fake-hermes-tui"], None, None)
     )
 
     # The client never sends a disconnect of its own — it only reads the one
@@ -176,7 +164,9 @@ def test_replay_cursor_is_strictly_validated_before_attach(pty_client, monkeypat
 
     ws, client, token = pty_client
     monkeypatch.setattr(
-        ws, "_resolve_chat_argv", lambda **kw: (["fake-hermes-tui"], None, None)
+        _web_server_chat,
+        "_resolve_chat_argv",
+        lambda **kw: (["fake-hermes-tui"], None, None),
     )
 
     url = _url(
@@ -223,9 +213,11 @@ def test_websocket_reconnect_passes_byte_cursor_to_session(pty_client, monkeypat
         def close(self):
             self.closed = True
 
-    monkeypatch.setattr(ws.PtyBridge, "spawn", _RetainedBridge.spawn)
+    monkeypatch.setattr(_web_server_chat.PtyBridge, "spawn", _RetainedBridge.spawn)
     monkeypatch.setattr(
-        ws, "_resolve_chat_argv", lambda **kw: (["fake-hermes-tui"], None, None)
+        _web_server_chat,
+        "_resolve_chat_argv",
+        lambda **kw: (["fake-hermes-tui"], None, None),
     )
 
     base = {"channel": "cursor-chan", "attach": "cursor-session"}
@@ -238,7 +230,7 @@ def test_websocket_reconnect_passes_byte_cursor_to_session(pty_client, monkeypat
     # inject detached output at the authoritative retained-buffer boundary.
     # The second connection still exercises the real route's query parsing and
     # attach() cursor propagation end to end.
-    session = ws.PTY_REGISTRY._sessions["cursor-session"]
+    session = _web_server_chat.PTY_REGISTRY._sessions["cursor-session"]
     session.buffer.append(b"\xa9\xff")
 
     with client.websocket_connect(
